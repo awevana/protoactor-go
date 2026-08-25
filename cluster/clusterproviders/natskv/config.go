@@ -22,6 +22,17 @@ const (
 	defaultWaiterWindow          = 15 * time.Second
 	defaultJanitorInterval       = 30 * time.Second
 
+	// defaultStartStepTimeout bounds each startup step that performs I/O
+	// (bucket ensure, register-self Put, initial member load, watch
+	// establishment, leader-election join). It deliberately exceeds the
+	// nats.go implicit per-call default (5s on a deadline-less context,
+	// jetstream.defaultAPITimeout) that it replaces, so no boot that used to
+	// succeed inside the client's own bound can newly fail -- while a wedged
+	// server fails the step in seconds, with the step, bucket, key, and
+	// elapsed time in the error, instead of hanging on whatever bound the
+	// client library does or does not apply.
+	defaultStartStepTimeout = 10 * time.Second
+
 	// defaultTombstoneTTL is how long a deleted identity's marker is retained
 	// before the server removes it. Without a TTL the marker is retained
 	// forever and the identities bucket's message count grows with every
@@ -138,6 +149,19 @@ type config struct {
 	// round-trip. It must exceed the member-side spawn budget (placement RPC),
 	// which can legitimately take ~10s+. It is independent of LockTTL.
 	RemoteActivationTimeout time.Duration
+
+	// StartStepTimeout is the provider-owned bound on each StartMember /
+	// StartClient step that performs I/O: member and leader bucket ensure,
+	// the register-self Put, the initial member load (watch establishment
+	// plus history drain), each watch (re-)establishment, and the
+	// leader-election join. Each step runs under its own
+	// context.WithTimeout derived from the provider context, so an earlier
+	// provider-context cancellation still wins. A value <= 0 disables the
+	// provider-owned bound: steps then fall back to whatever bound the
+	// client library applies (nats.go caps KV Put/ensure calls on a
+	// deadline-less context at its implicit 5s default, and applies NO bound
+	// at all to watch establishment).
+	StartStepTimeout time.Duration
 }
 
 // Option configures the NATS KV cluster provider.
@@ -237,6 +261,15 @@ func WithJanitorInterval(d time.Duration) Option {
 	return func(c *config) { c.JanitorInterval = d }
 }
 
+// WithStartStepTimeout sets the provider-owned bound on each startup step
+// that performs I/O (bucket ensure, register-self Put, initial member load,
+// watch establishment, leader-election join). A value <= 0 disables the
+// provider-owned bound, leaving each step to whatever bound the client
+// library applies.
+func WithStartStepTimeout(d time.Duration) Option {
+	return func(c *config) { c.StartStepTimeout = d }
+}
+
 // clampMarkerTTL raises a positive marker TTL to the server's floor and
 // normalises anything non-positive to "no marker TTL". Every LimitMarkerTTL
 // this package sets goes through it: the server rejects a sub-second
@@ -329,6 +362,7 @@ func newDefaultConfig() *config {
 		WriteFailureThreshold:   defaultWriteFailureThreshold,
 		WriteFailureWindow:      defaultWriteFailureWindow,
 		RemoteActivationTimeout: defaultRemoteActivationTO,
+		StartStepTimeout:        defaultStartStepTimeout,
 		// FailStop is intentionally left nil here. The nil value is a lazy
 		// sentinel: tripFailStop resolves it to defaultFailStop at trip time,
 		// not at Setup time, so the logger and leadership state are current
