@@ -25,9 +25,11 @@ import (
 	"github.com/awevoke/protoactor-go/remote"
 )
 
-// startObsGuard is how long a test waits for a step that the provider is
-// supposed to bound before declaring the bound broken. It is far above every
-// StartStepTimeout the tests configure, so a pass is never a lucky race.
+// startObsGuard is how long a test waits before declaring a liveness
+// expectation broken: in runStepBounded, for a step the provider is supposed
+// to bound to return; in respinWindow, for the watch-loop goroutine to exit
+// after shutdown. It is far above every StartStepTimeout the tests configure,
+// so a pass is never a lucky race.
 const startObsGuard = 5 * time.Second
 
 // startObsStepTimeout is the provider-owned per-step bound the tests
@@ -127,8 +129,10 @@ func (f *stepFakeJetStream) CreateOrUpdateKeyValue(ctx context.Context, cfg jets
 	return kv, nil
 }
 
-// newStepTestProvider builds a Provider around scripted buckets, with the
-// context wiring StartMember would have done, ready for direct step calls.
+// newStepTestProvider builds a Provider around an empty stepFakeJetStream --
+// it scripts no buckets; callers assign p.memberBucket / p.leaderBucket
+// directly -- with the context wiring StartMember would have done, ready for
+// direct step calls.
 func newStepTestProvider(t *testing.T, opts ...Option) *Provider {
 	t.Helper()
 
@@ -166,10 +170,10 @@ func runStepBounded(t *testing.T, what string, fn func() error) (time.Duration, 
 // TestStartMember_BlockingRegisterSelfFailsWithinStepTimeout is the incident
 // in miniature: buckets ensure fine, then the register-self Put never gets
 // its PubAck. StartMember must fail within the provider-owned StartStepTimeout
-// -- not hang to the client's own implicit ~5s API default, unnamed --
-// and the error must name the step, the bucket, the key, and the elapsed
-// time, because "register self: context deadline exceeded" has twice cost
-// hours of triage.
+// -- it must not run to the client's own implicit ~5s API default and fail
+// with an error that names nothing -- and the error must name the step, the
+// bucket, the key, and the elapsed time, because "register self: context
+// deadline exceeded" has twice cost hours of triage.
 func TestStartMember_BlockingRegisterSelfFailsWithinStepTimeout(t *testing.T) {
 	memberKV := &stepFakeKV{putFn: blockUntilCtxDone}
 	leaderKV := &stepFakeKV{}
@@ -269,7 +273,7 @@ func TestBucketEnsureErrors_NameBucketAndElapsed(t *testing.T) {
 }
 
 // TestLoadInitialMembers_StalledDrainFailsWithinStepTimeout covers the
-// initial member load step's DRAIN half — the piece with no client bound.
+// initial member load step's DRAIN half -- the piece with no client bound.
 // Establishment itself is capped ~5s by the client even on a deadline-less
 // context (the legacy subscribe path under kv.Watch wraps it with the legacy
 // JS context's MaxWait) and is not exercised here: the fake watchFn returns
@@ -310,10 +314,18 @@ func TestLoadInitialMembers_DrainCompletionUnchanged(t *testing.T) {
 	nodeB := NewNode("obscluster_b", "127.0.0.1", 4224, nil)
 	dataB, err := nodeB.Serialize()
 	require.NoError(t, err)
+	nodeGone := NewNode("obscluster_gone", "127.0.0.1", 4225, nil)
+	dataGone, err := nodeGone.Serialize()
+	require.NoError(t, err)
 
 	updates := make(chan jetstream.KeyValueEntry, 4)
 	updates <- stepFakeEntry{key: p.memberKey(nodeA.ID), value: dataA, op: jetstream.KeyValuePut}
-	updates <- stepFakeEntry{key: p.memberKey("gone"), op: jetstream.KeyValueDelete}
+	// The delete marker carries a real serialized node on purpose: a drain
+	// that stopped skipping delete markers would decode it and add a third
+	// member, so the Len==2 assertion below genuinely pins the skip. A
+	// value-less delete entry would not -- NewNodeFromBytes(nil) fails and
+	// the non-skipping path passes silently.
+	updates <- stepFakeEntry{key: p.memberKey(nodeGone.ID), value: dataGone, op: jetstream.KeyValueDelete}
 	updates <- stepFakeEntry{key: p.memberKey(nodeB.ID), value: dataB, op: jetstream.KeyValuePut}
 	updates <- nil // end-of-initial-values sentinel
 
@@ -393,8 +405,8 @@ func closedWatchKV() *stepFakeKV {
 // TestStartWatching_CleanCloseRespinHonorsRetryInterval pins that a clean
 // watcher close waits RetryInterval before the next Watch, exactly as an
 // erroring close always has. Before the fix the nil-return path respun with
-// zero delay: against a 300ms window and a 50ms interval that is thousands of
-// consumer creations instead of at most a handful.
+// zero delay: against a 300ms window and a 50ms interval that is a measured
+// ~1.9M Watch calls (consumer creations) instead of at most a handful.
 func TestStartWatching_CleanCloseRespinHonorsRetryInterval(t *testing.T) {
 	kv := closedWatchKV()
 	p := newStepTestProvider(t, WithRetryInterval(50*time.Millisecond))
