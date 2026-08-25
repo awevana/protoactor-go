@@ -166,7 +166,7 @@ func runStepBounded(t *testing.T, what string, fn func() error) (time.Duration, 
 // TestStartMember_BlockingRegisterSelfFailsWithinStepTimeout is the incident
 // in miniature: buckets ensure fine, then the register-self Put never gets
 // its PubAck. StartMember must fail within the provider-owned StartStepTimeout
-// -- not hang on whatever bound the client library does or does not apply --
+// -- not hang to the client's own implicit ~5s API default, unnamed --
 // and the error must name the step, the bucket, the key, and the elapsed
 // time, because "register self: context deadline exceeded" has twice cost
 // hours of triage.
@@ -268,14 +268,14 @@ func TestBucketEnsureErrors_NameBucketAndElapsed(t *testing.T) {
 	}
 }
 
-// TestLoadInitialMembers_StalledDrainFailsWithinStepTimeout covers the watch
-// establishment step. Establishment itself is capped ~5s by the client even
-// on a deadline-less context (the legacy subscribe path under kv.Watch wraps
-// it with the legacy JS context's MaxWait), but the post-establishment drain
-// carries no client bound at all: a watcher that is established but never
-// delivers its initial values would park the drain loop forever. Both halves
-// of the step must fail within StartStepTimeout with the named detail, and
-// the established watcher must be stopped on the way out.
+// TestLoadInitialMembers_StalledDrainFailsWithinStepTimeout covers the
+// initial member load step's DRAIN half — the piece with no client bound.
+// Establishment itself is capped ~5s by the client even on a deadline-less
+// context (the legacy subscribe path under kv.Watch wraps it with the legacy
+// JS context's MaxWait) and is not exercised here: the fake watchFn returns
+// an established watcher immediately. What must hold: a watcher that never
+// delivers its initial values fails the drain within StartStepTimeout with
+// the named detail, and the established watcher is stopped on the way out.
 func TestLoadInitialMembers_StalledDrainFailsWithinStepTimeout(t *testing.T) {
 	watcher := &stepFakeWatcher{updates: make(chan jetstream.KeyValueEntry)} // never delivers
 	memberKV := &stepFakeKV{watchFn: func(_ context.Context, _ string, _ ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
