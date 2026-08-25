@@ -386,19 +386,21 @@ func (p *Provider) createLeaderBucket() error {
 // startStepContext bounds one startup step that performs I/O. The context is
 // derived from the provider context, so an earlier cancellation (Shutdown)
 // still wins; the StartStepTimeout deadline replaces the client library's
-// hidden per-call default (nats.go caps KV calls on a deadline-less context
-// at its implicit 5s, and applies no bound at all to watch establishment),
-// making the bound provider-owned and configurable. A non-positive
-// StartStepTimeout disables the deadline and restores the client's own
-// behaviour.
+// hidden per-call default (nats.go caps KV calls -- watch establishment
+// included, via the legacy JS context's MaxWait -- on a deadline-less
+// context at its implicit 5s; the one wait it never bounds is the
+// post-establishment history drain), making the bound provider-owned and
+// configurable. A non-positive StartStepTimeout disables the deadline and
+// restores the client's own behaviour.
 //
 // It must NOT be used for the long-lived watches (keepWatching,
 // keepWatchingLeader): the context passed to a KV Watch governs the
 // subscription's whole lifetime -- nats.go unsubscribes the underlying
-// subscription as soon as that context is done (js.Subscribe's ctx goroutine,
-// nats.go js.go) -- so a deadline there would kill every live watcher when it
-// expired. loadInitialMembers is safe because its watcher is scoped to the
-// step and stopped before the step returns.
+// subscription as soon as that context is done (js.Subscribe's ctx-done
+// goroutine, nats.go v1.52.0 js.go:2050-2055) -- so a deadline there would
+// kill every live watcher when it expired. loadInitialMembers is safe
+// because its watcher is scoped to the step and stopped before the step
+// returns.
 func (p *Provider) startStepContext() (context.Context, context.CancelFunc) {
 	if p.config.StartStepTimeout <= 0 {
 		return context.WithCancel(p.ctx)
@@ -459,14 +461,15 @@ func (p *Provider) registerSelf() error {
 // as a sentinel value to indicate the end of initial values.
 //
 // The whole step -- watch establishment plus the history drain -- runs under
-// the provider-owned step timeout. Without it the step is UNBOUNDED: the
-// legacy subscribe path under kv.Watch applies no default timeout to a
-// deadline-less context, and a watcher that is established but never delivers
-// parks the drain forever. The step context is safe to hand to this Watch
-// because the watcher is scoped to the step (see startStepContext); nats.go
-// unsubscribes the subscription when the context is done, which closes the
-// updates channel -- so a drain cut short that way must be reported as the
-// timeout it is, never mistaken for a completed load.
+// the provider-owned step timeout. Establishment already carries the
+// client's own cap (~5s: the legacy subscribe path under kv.Watch wraps a
+// deadline-less context with the legacy JS context's MaxWait); the DRAIN is
+// what the client never bounds -- a watcher that is established but never
+// delivers parks the drain forever without this timeout. The step context is
+// safe to hand to this Watch because the watcher is scoped to the step (see
+// startStepContext); nats.go unsubscribes the subscription when the context
+// is done, which closes the updates channel -- so a drain cut short that way
+// must be reported as the timeout it is, never mistaken for a completed load.
 func (p *Provider) loadInitialMembers() error {
 	bucketName := p.config.memberBucketName(p.clusterName)
 	keys := p.config.KeyPrefix + ".members.>"

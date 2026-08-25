@@ -269,11 +269,13 @@ func TestBucketEnsureErrors_NameBucketAndElapsed(t *testing.T) {
 }
 
 // TestLoadInitialMembers_StalledDrainFailsWithinStepTimeout covers the watch
-// establishment step. The legacy subscribe path under kv.Watch applies NO
-// default timeout at all to a deadline-less context, and a watcher that is
-// established but never delivers its initial values would park the drain loop
-// forever. Both halves of the step must fail within StartStepTimeout with the
-// named detail, and the established watcher must be stopped on the way out.
+// establishment step. Establishment itself is capped ~5s by the client even
+// on a deadline-less context (the legacy subscribe path under kv.Watch wraps
+// it with the legacy JS context's MaxWait), but the post-establishment drain
+// carries no client bound at all: a watcher that is established but never
+// delivers its initial values would park the drain loop forever. Both halves
+// of the step must fail within StartStepTimeout with the named detail, and
+// the established watcher must be stopped on the way out.
 func TestLoadInitialMembers_StalledDrainFailsWithinStepTimeout(t *testing.T) {
 	watcher := &stepFakeWatcher{updates: make(chan jetstream.KeyValueEntry)} // never delivers
 	memberKV := &stepFakeKV{watchFn: func(_ context.Context, _ string, _ ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
