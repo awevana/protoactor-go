@@ -171,7 +171,7 @@ func runStepBounded(t *testing.T, what string, fn func() error) (time.Duration, 
 // in miniature: buckets ensure fine, then the register-self Put never gets
 // its PubAck. StartMember must fail within the provider-owned StartStepTimeout
 // -- it must not run to the client's own implicit ~5s API default and fail
-// with an error that names nothing -- and the error must name the step, the
+// with an error that names only the step -- and the error must name the step, the
 // bucket, the key, and the elapsed time, because "register self: context
 // deadline exceeded" has twice cost hours of triage.
 func TestStartMember_BlockingRegisterSelfFailsWithinStepTimeout(t *testing.T) {
