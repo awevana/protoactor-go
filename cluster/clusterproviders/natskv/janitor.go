@@ -66,6 +66,41 @@ func (il *IdentityLookup) runJanitor() {
 	ticker := time.NewTicker(il.config.JanitorInterval)
 	defer ticker.Stop()
 
+	// The previous release's per-member tracking records are fanned out from
+	// here, and that placement is load-bearing rather than convenient.
+	//
+	// Setup cannot do it: Cluster.StartMember calls IdentityLookup.Setup
+	// BEFORE ClusterProvider.StartMember (cluster/cluster.go), and leader
+	// election runs inside the latter, so at Setup time IsLeader() is false on
+	// every node -- a one-shot leader check started from Setup would migrate
+	// nothing, on every node, forever. This loop is the first leader-gated
+	// thing that exists, it is already off the startup path, and it already
+	// stops on janitorStop, so the migration inherits all three properties and
+	// reuses this gate instead of growing a second leadership check.
+	//
+	// It runs at most once per pass and stops for good once the bucket reports
+	// clean, so the steady-state sweep cost is untouched. If the janitor is
+	// disabled (JanitorInterval <= 0) the migration does not run at all, and
+	// that is safe: the read path returns the union of both shapes for this
+	// whole release, so an un-migrated bucket is correct, merely fatter.
+	//
+	// The latch is per-goroutine and never re-arms, and that has one honest
+	// consequence during a mixed-version fleet: a legacy record written by a
+	// still-old node AFTER this leader's first clean pass is BRIDGED but not
+	// FANNED OUT -- every reader still returns it, because memberTracking and
+	// ListGrains union both shapes for the whole release, but this leader will
+	// not migrate it until its janitor goroutine is replaced (leadership
+	// change, or process restart). The alternative -- re-arming -- would buy a
+	// bucket enumeration on every tick, forever, to chase a window that closes
+	// when the last old node leaves. A pass is only "done" if it is free of
+	// every legacy record it enumerated -- a failed or CAS-lost purge keeps it
+	// unfinished (fanOutLegacyMemberRecord), so the latch cannot close over a
+	// record this leader saw and failed to remove -- AND its own deadline did
+	// not cut the enumeration short: a truncated pass can have nothing to
+	// report pending for a record it never reached, so it must also fail
+	// closed on ctx.Err() alone (migrateLegacyMemberRecords).
+	migrationDone := false
+
 	for {
 		select {
 		case <-il.janitorStop:
@@ -73,6 +108,9 @@ func (il *IdentityLookup) runJanitor() {
 		case <-ticker.C:
 			if il.isClient || !il.provider.IsLeader() {
 				continue
+			}
+			if !migrationDone {
+				migrationDone = il.migrateLegacyMemberRecords(context.Background())
 			}
 			il.janitorSweep(context.Background(), ac)
 		}
@@ -85,8 +123,14 @@ func (il *IdentityLookup) runJanitor() {
 //   - Lock-only record (PidID == "") older than HardReapAge: CAS-delete.
 //   - Activation (PidID set) whose member key is absent from the members bucket:
 //     record absence via ac; delete only when BOTH (a) >= 2 sweep observations
-//     AND (b) age-since-first-observation >= ActivationAbsentGrace.
+//     AND (b) age-since-first-observation >= ActivationAbsentGrace, and the
+//     member is still absent on an authoritative point Get.
 //     If the member key is restored between sweeps, ac entry is cleared.
+//
+// Round-trip budget: TWO enumerations (identities, then members) plus one
+// identities Get per key, i.e. 2+N. The membership question used to be a KV Get
+// per activation record with a PID, making the sweep 1+2N over a set that
+// changes only on topology events; one snapshot answers all of them.
 func (il *IdentityLookup) janitorSweep(ctx context.Context, ac *janitorAbsenceClock) {
 	start := il.now()
 
@@ -99,6 +143,8 @@ func (il *IdentityLookup) janitorSweep(ctx context.Context, ac *janitorAbsenceCl
 		il.recordJanitorSweep("error")
 		return
 	}
+
+	members := il.memberSnapshot(ctx)
 
 	now := start
 	var scanned, lockReaps, activationCleans, sweepErrors int
@@ -130,15 +176,39 @@ func (il *IdentityLookup) janitorSweep(ctx context.Context, ac *janitorAbsenceCl
 					slog.String("key", key),
 					slog.String("memberID", rec.MemberID),
 					slog.Duration("age", age))
-				il.casDelete(ctx, key, entry.Revision(), "janitor/hard-reap-lock")
+				// Count only a purge the server actually stored: err == nil is
+				// exactly "a purge marker now exists for this key". A CAS
+				// conflict stores nothing and must not be counted (see
+				// TestCasDelete_PurgeOutcomes for casDelete's own contract).
+				if err := il.casDelete(ctx, key, entry.Revision(), "janitor/hard-reap-lock"); err == nil {
+					il.recordTombstonePurge()
+				}
 				lockReaps++
 				il.recordJanitorReap("lock")
 				// No absence state to clear: lock records are not tracked in ac.
 			}
 		} else {
-			// Completed activation: check whether the owning member key exists
-			// in the members bucket (direct KV read, not the in-memory list).
-			memberPresent := rec.MemberID != "" && il.provider.MemberKeyExists(ctx, rec.MemberID)
+			// Completed activation: is the owning member still in the members
+			// bucket? Answered from the ONE snapshot taken before this loop,
+			// not from a Get per record.
+			if len(members) == 0 {
+				// No usable membership answer this sweep. Treat every
+				// activation as present: fail closed, so the absence clock
+				// does not advance and nothing is reaped on missing
+				// information. An empty answer counts as missing, not as "the
+				// cluster has no members" -- this sweep runs only on the
+				// leader, and a leader is itself a member, so an empty members
+				// bucket is a broken observation. Lock reaping is unaffected;
+				// it never consults membership.
+				ac.clear(key)
+				continue
+			}
+
+			_, memberPresent := members[rec.MemberID]
+			if rec.MemberID == "" {
+				memberPresent = false
+			}
+
 			if memberPresent {
 				// Member key exists -- clear any accumulated absence state.
 				ac.clear(key)
@@ -147,12 +217,31 @@ func (il *IdentityLookup) janitorSweep(ctx context.Context, ac *janitorAbsenceCl
 				firstSeen, count := ac.observe(key, now)
 				elapsed := now.Sub(firstSeen)
 				if count >= 2 && elapsed >= il.config.ActivationAbsentGrace {
+					// Confirm before deleting. The snapshot is a watcher-backed
+					// enumeration, and a truncated one surfaces no error -- the
+					// provider's reconcileMembers guards its own prune with the
+					// same authoritative point Get, for the same reason. Here
+					// the stake is a live grain's activation record, so the
+					// absence CLOCK may run on the cheap snapshot but the
+					// irreversible delete may not. This costs one Get per REAP,
+					// which is zero in steady state, not one per record.
+					if rec.MemberID != "" && il.provider.MemberKeyExists(ctx, rec.MemberID) {
+						il.identityLogger().Debug("natskv janitor: member reappeared on confirmation; not reaping",
+							slog.String("key", key),
+							slog.String("memberID", rec.MemberID))
+						ac.clear(key)
+						continue
+					}
+
 					il.identityLogger().Info("natskv janitor: reaping activation with absent member",
 						slog.String("key", key),
 						slog.String("memberID", rec.MemberID),
 						slog.Int("observations", count),
 						slog.Duration("absentFor", elapsed))
-					il.casDelete(ctx, key, entry.Revision(), "janitor/absent-member")
+					// Same err == nil gate as the hard-reap-lock site above.
+					if err := il.casDelete(ctx, key, entry.Revision(), "janitor/absent-member"); err == nil {
+						il.recordTombstonePurge()
+					}
 					activationCleans++
 					il.recordJanitorReap("activation")
 					ac.clear(key)
@@ -161,7 +250,8 @@ func (il *IdentityLookup) janitorSweep(ctx context.Context, ac *janitorAbsenceCl
 		}
 	}
 
-	durationMs := il.now().Sub(start).Milliseconds()
+	elapsed := il.now().Sub(start)
+	durationMs := elapsed.Milliseconds()
 	workDone := lockReaps > 0 || activationCleans > 0
 	// Summary line: Info when the sweep did work or hit errors, Debug when the
 	// sweep was entirely quiet (all zeros), so operators see reaps/faults but
@@ -184,6 +274,30 @@ func (il *IdentityLookup) janitorSweep(ctx context.Context, ac *janitorAbsenceCl
 		outcome = "work"
 	}
 	il.recordJanitorSweep(outcome)
+	il.recordJanitorCost(elapsed, scanned)
+}
+
+// memberSnapshot takes the sweep's one membership enumeration, or reports nil
+// when it cannot. Nil is "no answer": the caller must fail closed on it, never
+// read it as "every member is gone".
+func (il *IdentityLookup) memberSnapshot(ctx context.Context) map[string]struct{} {
+	if il.provider == nil {
+		return nil
+	}
+
+	members, err := il.provider.MemberKeysSnapshot(ctx)
+	if err != nil {
+		// A member-list failure makes every activation look absent, which
+		// would reap the whole bucket. Skip the activation half of this sweep
+		// entirely; lock reaping is unaffected because it does not consult
+		// membership.
+		il.identityLogger().Warn("natskv janitor: member snapshot failed; skipping activation checks",
+			slog.Any("error", err))
+
+		return nil
+	}
+
+	return members
 }
 
 // recordJanitorSweep bumps the sweep-outcome counter, labelled by outcome
@@ -194,6 +308,64 @@ func (il *IdentityLookup) recordJanitorSweep(outcome string) {
 	}
 	il.provider.providerMetrics.JanitorSweepTotal.Add(context.Background(), 1,
 		metric.WithAttributes(attribute.String("outcome", outcome)))
+}
+
+// recordJanitorCost publishes what one sweep cost: its wall duration in
+// seconds and the number of identity keys it enumerated. Both are values
+// janitorSweep already computes for its summary log line, so recording them
+// adds no work and no round trip -- the sweep was 36% of hub NATS egress and
+// nothing in-process reported it.
+//
+// "Enumerated", not "live": liveKeys is janitorSweep's scanned, which
+// increments for every key its ListKeys call returned, BEFORE the per-key Get
+// that would confirm the record is still there. ListKeys already excludes
+// purge-marker tombstones server-side, but a key whose Get subsequently fails
+// -- e.g. a benign not-found race against a concurrent delete -- is still
+// counted here; only the reap decision, not this gauge, consults the Get
+// result. It answers "how much did this sweep have to look at", which is the
+// sweep-cost question this instrument exists for, not a precise census of
+// live activations.
+//
+// Neither carries an attribute, because nothing in this package does: the
+// existing recorders label only the thing they classify (outcome, type), and
+// the scrape target's own namespace/job/pod labels identify the cluster.
+//
+// Deliberately NOT called on the ListKeys-failure path. That sweep enumerated
+// nothing, so a duration sample there would report a suspiciously fast sweep
+// and a live-key gauge of zero would claim the bucket is empty;
+// recordJanitorSweep("error") is that path's signal.
+//
+// No-op when metrics are disabled.
+func (il *IdentityLookup) recordJanitorCost(elapsed time.Duration, liveKeys int) {
+	if il.provider == nil || !il.provider.metricsEnabled || il.provider.providerMetrics == nil {
+		return
+	}
+
+	ctx := context.Background()
+	il.provider.providerMetrics.JanitorSweepDuration.Record(ctx, elapsed.Seconds())
+	il.provider.providerMetrics.JanitorLiveKeys.Record(ctx, int64(liveKeys))
+}
+
+// recordTombstonePurge bumps the tombstone-purge counter. Called from THIS
+// FILE'S two reap sites only -- janitorSweep's hard-reap-lock and
+// absent-member branches, each guarded by its own casDelete's returned error
+// -- and nowhere else. That is deliberate, not incidental: casDelete has
+// fifteen production call sites in natskv_identity.go, and thirteen of them
+// (resolveIdentity's grace/no-target paths, maybeReapLock's owner-absent
+// branch, activateLocal/activateRemote's store-failure cleanups,
+// cleanupOwnRecord, removeMemberID) fire on ordinary CAS losses, lock steals
+// and member departures -- routine identity churn, not the janitor sweeping
+// anything. Counting those here would make this family answer "how much
+// identity churn is there" instead of what its name, its HELP text and the
+// runbook's NatsKVJanitorSweepSlow "First checks" step all promise: how much
+// the janitor's own sweep is actually removing. No-op when metrics are
+// disabled.
+func (il *IdentityLookup) recordTombstonePurge() {
+	if il.provider == nil || !il.provider.metricsEnabled || il.provider.providerMetrics == nil {
+		return
+	}
+
+	il.provider.providerMetrics.JanitorTombstonePurgeTotal.Add(context.Background(), 1)
 }
 
 // recordJanitorReap bumps the reap counter, labelled by type ("lock" or

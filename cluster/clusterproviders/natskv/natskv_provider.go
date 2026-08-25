@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 	natskvmetrics "github.com/awevoke/protoactor-go/cluster/clusterproviders/natskv/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
@@ -114,6 +116,41 @@ func (p *Provider) IdentityLookup() *IdentityLookup {
 	return p.identity
 }
 
+// recordMarkerTTLEnabled publishes the identity buckets' marker-TTL state as a
+// gauge, one series per bucket: 1 when that bucket's delete markers expire
+// server-side, 0 when it retains every one of them forever.
+//
+// Why here and not in IdentityLookup.Setup, where the answer is computed:
+// Cluster.StartMember calls IdentityLookup.Setup BEFORE
+// ClusterProvider.StartMember (cluster/cluster.go), so at Setup time
+// providerMetrics is still nil and a record there would go nowhere. This is
+// the same ordering that keeps the legacy-record migration in runJanitor
+// rather than in Setup. Both start paths call it, because a client's buckets
+// are created by the same Setup and can fall back the same way.
+//
+// A lookup whose Setup failed records nothing. Absence is the honest state for
+// a node that has no identity buckets at all; a 0 would report a
+// marker-retention problem in place of a setup failure.
+func (p *Provider) recordMarkerTTLEnabled() {
+	if !p.metricsEnabled || p.providerMetrics == nil || p.identity == nil {
+		return
+	}
+
+	if p.identity.setupErr != nil {
+		return
+	}
+
+	for _, st := range p.identity.markerTTLStates {
+		enabled := int64(0)
+		if st.enabled {
+			enabled = 1
+		}
+
+		p.providerMetrics.MarkerTTLEnabled.Record(context.Background(), enabled,
+			metric.WithAttributes(attribute.String("bucket", st.bucket)))
+	}
+}
+
 // GetHealthStatus returns an error if the cluster health status has problems.
 func (p *Provider) GetHealthStatus() error {
 	p.clusterErrMu.Lock()
@@ -174,6 +211,7 @@ func (p *Provider) StartMember(c *cluster.Cluster) error {
 
 	p.providerMetrics = natskvmetrics.NewNatsKVMetrics(c.Logger())
 	p.metricsEnabled = c.MetricsEnabled()
+	p.recordMarkerTTLEnabled()
 
 	if err := p.createMemberBucket(); err != nil {
 		return err
@@ -216,6 +254,7 @@ func (p *Provider) StartClient(c *cluster.Cluster) error {
 
 	p.providerMetrics = natskvmetrics.NewNatsKVMetrics(c.Logger())
 	p.metricsEnabled = c.MetricsEnabled()
+	p.recordMarkerTTLEnabled()
 
 	if err := p.createMemberBucket(); err != nil {
 		return err
@@ -285,14 +324,25 @@ func (p *Provider) UpdateKinds(kinds []string) error {
 // createMemberBucket creates or binds the member KV bucket.
 // The bucket is configured with a TTL so that keys expire if not refreshed,
 // and LimitMarkerTTL so that watchers receive delete notifications on expiry.
+//
+// The marker TTL is clamped, the key TTL is not, and the two floors differ.
+// SubjectDeleteMarkerTTL must be at least ONE SECOND (nats-server stream.go:
+// "subject delete marker TTL must be at least 1 second"); MaxAge, which is
+// where the key TTL lands, has a floor of its own at 100ms ("max age needs to
+// be >= 100ms", same file). Both rejections fail bucket creation -- i.e. fail
+// StartMember -- rather than degrading. So a MemberTTL between 100ms and one
+// second keeps expiring keys exactly as configured while its markers are
+// raised to a second, and a MemberTTL BELOW 100ms is a startup outage that
+// this clamp does not and cannot prevent: it clamps the marker TTL only.
 func (p *Provider) createMemberBucket() error {
 	bucketName := p.config.memberBucketName(p.clusterName)
 
 	kv, err := p.js.CreateOrUpdateKeyValue(p.ctx, jetstream.KeyValueConfig{
-		Bucket:         bucketName,
-		Replicas:       p.config.Replicas,
-		TTL:            p.config.MemberTTL,
-		LimitMarkerTTL: p.config.MemberTTL, // emit delete markers for TTL-expired keys
+		Bucket:   bucketName,
+		Replicas: p.config.Replicas,
+		TTL:      p.config.MemberTTL,
+		// emit delete markers for TTL-expired keys
+		LimitMarkerTTL: clampMarkerTTL(p.config.MemberTTL),
 	})
 	if err != nil {
 		return fmt.Errorf("natskv: create member bucket %q: %w", bucketName, err)
@@ -304,7 +354,8 @@ func (p *Provider) createMemberBucket() error {
 
 // createLeaderBucket creates a separate KV bucket for leader election with
 // its own TTL (LeaderTTL), so the leader key can have a different TTL than
-// member keys.
+// member keys. The marker TTL is clamped to the server floor for the same
+// reason as the member bucket's; see createMemberBucket.
 func (p *Provider) createLeaderBucket() error {
 	bucketName := p.config.memberBucketName(p.clusterName) + "_leader"
 
@@ -312,7 +363,7 @@ func (p *Provider) createLeaderBucket() error {
 		Bucket:         bucketName,
 		Replicas:       p.config.Replicas,
 		TTL:            p.config.LeaderTTL,
-		LimitMarkerTTL: p.config.LeaderTTL,
+		LimitMarkerTTL: clampMarkerTTL(p.config.LeaderTTL),
 	})
 	if err != nil {
 		return fmt.Errorf("natskv: create leader bucket %q: %w", bucketName, err)
@@ -989,6 +1040,51 @@ func (p *Provider) MemberKeyExists(ctx context.Context, memberID string) bool {
 	}
 	_, err := p.memberBucket.Get(ctx, p.memberKey(memberID))
 	return err == nil
+}
+
+// MemberKeysSnapshot returns the member ids present in the members bucket, as
+// a set, in ONE enumeration.
+//
+// MemberKeyExists is a KV Get, and the janitor called it once per activation
+// record with a PID -- the second leg that makes a sweep 1+2N instead of 2+N,
+// and the reason the measured get count exceeded the listed key count. The
+// member set is small and changes only on topology events, so one snapshot per
+// sweep answers every probe the sweep would have made.
+//
+// A nil map with a nil error means "no answer", not "no members": callers must
+// treat that as missing information rather than as an empty cluster, because
+// reading it as an empty cluster would make every activation look orphaned.
+func (p *Provider) MemberKeysSnapshot(ctx context.Context) (map[string]struct{}, error) {
+	if p.memberBucket == nil {
+		return nil, nil
+	}
+
+	lister, err := p.memberBucket.ListKeys(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("natskv: list member keys: %w", err)
+	}
+
+	out := make(map[string]struct{})
+
+	for key := range lister.Keys() {
+		if id, ok := p.memberIDFromKey(key); ok {
+			out[id] = struct{}{}
+		}
+	}
+
+	return out, nil
+}
+
+// memberIDFromKey inverts memberKey. It reports false for a key that does not
+// carry the members prefix, so a foreign key in the bucket is skipped rather
+// than turned into a phantom member.
+func (p *Provider) memberIDFromKey(key string) (string, bool) {
+	id, ok := strings.CutPrefix(key, p.config.KeyPrefix+".members.")
+	if !ok || id == "" {
+		return "", false
+	}
+
+	return id, true
 }
 
 // splitHostPort parses an address string into host and port components.

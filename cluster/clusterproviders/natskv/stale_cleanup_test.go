@@ -3,7 +3,6 @@ package natskv
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -139,11 +138,8 @@ func TestStale_TopologyLeave_CleansAllMemberActivations(t *testing.T) {
 		rec := il.getExistingActivation(ctx, ci)
 		require.NotNil(t, rec, "activation %d should exist before cleanup", i)
 	}
-	trackEntry, err := tracking.Get(ctx, deadMemberID)
-	require.NoError(t, err, "member tracking record should exist")
-	var mrec memberRecord
-	require.NoError(t, json.Unmarshal(trackEntry.Value(), &mrec))
-	assert.Len(t, mrec.Keys, 5, "tracking record should have 5 keys")
+	assert.Len(t, listTrackingKeys(t, il, deadMemberID), 5,
+		"the member should hold one tracking sub-key per grain before cleanup")
 
 	// Simulate topology leave by calling removeMemberID directly.
 	// In production, this is triggered by the ClusterTopology event handler
@@ -157,10 +153,16 @@ func TestStale_TopologyLeave_CleansAllMemberActivations(t *testing.T) {
 		assert.Nil(t, rec, "activation %d should be deleted after topology leave", i)
 	}
 
-	// Verify the tracking record is gone.
+	// Verify the member's tracking state is gone. Under per-member sub-keys
+	// that is the SUB-KEYS, not one per-member record: leaving them behind
+	// would grow the tracking bucket by one key per grain for every member
+	// that ever departed.
+	assert.Empty(t, listTrackingKeys(t, il, deadMemberID),
+		"member tracking sub-keys should be deleted after topology leave")
+
 	_, err = tracking.Get(ctx, deadMemberID)
 	assert.ErrorIs(t, err, jetstream.ErrKeyNotFound,
-		"member tracking record should be deleted after topology leave")
+		"and no legacy per-member record should be left either")
 }
 
 // TestStale_OrphanedMemberTracking_NoErrors verifies that removeMemberID
@@ -288,32 +290,12 @@ func TestStale_RemoveActivation_CAS_DoesNotDeleteNewActivation(t *testing.T) {
 	// The callback should read the current entry, see the PID doesn't match
 	// (it's now node B's PID), and skip deletion.
 	//
-	// Build the RemoveActivation callback the same way setupPlacementActor does.
-	removeActivation := func(rmCtx context.Context, rmCI *cluster.ClusterIdentity, rmPid *actor.PID) error {
-		key := kvKey(rmCI)
-		entry, err := il.identities.Get(rmCtx, key)
-		if err != nil {
-			if errors.Is(err, jetstream.ErrKeyNotFound) {
-				return nil
-			}
-			return err
-		}
-		var rec activationRecord
-		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
-			return err
-		}
-		// Only delete if PID matches.
-		if rec.PidID != rmPid.Id || rec.PidAddress != rmPid.Address {
-			return nil // PID changed — someone else re-activated
-		}
-		if rec.MemberID != "" {
-			il.removeKeyFromMember(rmCtx, rec.MemberID, key)
-		}
-		return il.identities.Delete(rmCtx, key, jetstream.LastRevision(entry.Revision()))
-	}
-
-	// Call RemoveActivation with node A's OLD PID.
-	err = removeActivation(ctx, ci, pidA)
+	// This is the production callback itself (setupPlacementActor passes
+	// il.removeActivation as PlacementConfig.RemoveActivation), not a copy of
+	// its logic: a copy silently stops testing the real path the moment the
+	// real one changes, which is exactly what happened when the delete became
+	// an expiring purge.
+	err = il.removeActivation(ctx, ci, pidA)
 	assert.NoError(t, err, "RemoveActivation should not error (PID mismatch -> skip)")
 
 	// Step 4: Verify node B's activation survived.

@@ -115,6 +115,36 @@ type IdentityLookup struct {
 	// writeGuard tracks consecutive identity-write failures and drives the
 	// fail-stop watchdog. See writeFailureGuard.
 	writeGuard writeFailureGuard
+
+	// markerTTLEnabled records whether the identity buckets were actually
+	// created with marker TTLs. It is set once, in Setup, and read only by
+	// tombstoneOpts, where it gates PurgeTTL: a PurgeTTL stamps a Nats-TTL
+	// header, and the server rejects that header on a stream with
+	// AllowMsgTTL: false, so attaching it to a bucket that fell back would
+	// make every identity delete fail.
+	//
+	// It is false in three cases, not one: where createBucketWithMarkerTTL took
+	// its fallback (which no topology reaches today -- see that function for
+	// why); where TombstoneTTL is <= 0, which skips the TTL-carrying attempt
+	// altogether and is a supported configuration; and where the two buckets
+	// disagree, since Setup takes their CONJUNCTION. Keeping the gate is what
+	// makes each of those a real degradation rather than a different outage.
+	markerTTLEnabled bool
+
+	// markerTTLStates records the same answer PER BUCKET, in Setup, for the
+	// MarkerTTLEnabled gauge. The conjunction above is what governs behaviour;
+	// this is what an operator needs, because the remedy differs by bucket:
+	// the identities bucket can be rotated with WithIdentityBucket, while the
+	// tracking bucket's name is derived from the cluster name and has no
+	// override at all. Written once in Setup and read only by
+	// Provider.recordMarkerTTLEnabled, which runs later on the same goroutine.
+	markerTTLStates []markerTTLState
+}
+
+// markerTTLState is one bucket's answer to "was it created with marker TTLs".
+type markerTTLState struct {
+	bucket  string
+	enabled bool
 }
 
 // SetsOwnPidCache returns true, signalling to DefaultContext that this
@@ -199,6 +229,81 @@ func newIdentityLookup(p *Provider) *IdentityLookup {
 	}
 }
 
+// createBucketWithMarkerTTL creates cfg's bucket with LimitMarkerTTL set, and
+// retries once without it when the server does not support marker TTLs.
+//
+// LimitMarkerTTL requires JetStream API level >= 1; nats.go probes AccountInfo
+// and returns ErrLimitMarkerTTLNotSupported below that. Every OTHER error is
+// fatal and propagates: a fallback that hid a dead NATS connection would hide a
+// broken identity write path.
+//
+// The fallback is DEFENCE IN DEPTH, not a live degradation path. On a
+// pre-API-level-1 server no topology that exists today survives to use it: the
+// provider's own member and leader buckets pass LimitMarkerTTL with no
+// capability probe and no fallback of their own (createMemberBucket /
+// createLeaderBucket, whose value is clampMarkerTTL of the key TTL and so is
+// positive for every positive MemberTTL/LeaderTTL, i.e. for every default and
+// every sane configuration), so Provider.StartMember and Provider.StartClient
+// both fail outright on such a server. Cluster.StartMember and Cluster.StartClient call IdentityLookup.Setup
+// BEFORE the provider's Start* (cluster/cluster.go), so the order of events is:
+// this ladder degrades with a WARN, and moments later the cluster fails to
+// start anyway. What the ladder buys is that an IdentityLookup driven WITHOUT
+// those provider buckets keeps working -- no such wiring exists in-tree, so
+// treat this as a guard on a future one, and keep the WARN so the fallback is
+// never silent.
+//
+// The returned bool is load-bearing wherever the fallback IS taken: casDelete's
+// and the passivation sites' PurgeTTL stamps a Nats-TTL header, and nats-server
+// rejects that header on a stream with AllowMsgTTL: false. Attaching it to a
+// bucket that fell back would make every identity delete fail. See
+// tombstoneOpts.
+//
+// ttl is clamped here rather than trusted from the caller, so that "creates
+// cfg's bucket with LimitMarkerTTL set" is literally true for every ttl this
+// function accepts. A positive sub-second marker TTL is rejected by the server
+// with JSStreamInvalidConfig, which is NOT the capability error the fallback
+// keys on, so an unclamped caller would turn a mis-set knob into a startup
+// outage instead of a clamp. WithTombstoneTTL clamps too; that is the option's
+// contract, this is the function's own.
+//
+// Round-trip cost: the TTL-carrying attempt adds one AccountInfo call per
+// bucket per process start (nats.go issues one from prepareKeyValueConfig
+// regardless, and a second one only when LimitMarkerTTL is set).
+func createBucketWithMarkerTTL(
+	ctx context.Context,
+	js jetstream.JetStream,
+	cfg jetstream.KeyValueConfig,
+	ttl time.Duration,
+	logger *slog.Logger,
+) (kv jetstream.KeyValue, markerTTLEnabled bool, err error) {
+	ttl = clampMarkerTTL(ttl)
+
+	if ttl > 0 {
+		withTTL := cfg
+		withTTL.LimitMarkerTTL = ttl
+
+		kv, err = js.CreateOrUpdateKeyValue(ctx, withTTL)
+		if err == nil {
+			return kv, true, nil
+		}
+
+		if !errors.Is(err, jetstream.ErrLimitMarkerTTLNotSupported) {
+			return nil, false, err
+		}
+
+		logger.Warn("natskv identity: server does not support KV marker TTLs; delete markers will accumulate",
+			slog.String("bucket", cfg.Bucket),
+			slog.Duration("requestedTTL", ttl))
+	}
+
+	kv, err = js.CreateOrUpdateKeyValue(ctx, cfg)
+	if err != nil {
+		return nil, false, err
+	}
+
+	return kv, false, nil
+}
+
 // Setup initializes the identity lookup with the cluster context, creates the
 // required KV buckets, and subscribes to topology events for member cleanup.
 func (il *IdentityLookup) Setup(c *cluster.Cluster, kinds []string, isClient bool) {
@@ -211,15 +316,96 @@ func (il *IdentityLookup) Setup(c *cluster.Cluster, kinds []string, isClient boo
 	il.isClient = isClient
 	il.inflights = make(map[string]*inflight)
 
+	// A member id containing '.' is a hard startup failure, not a warning.
+	//
+	// '.' is the tracking sub-key separator (trackingSubKey), and it is the
+	// separator precisely because it is the NATS SUBJECT separator. With a dot
+	// in the member half, trackingKeyMember splits at the FIRST dot: every one
+	// of this node's sub-keys is attributed to a prefix of its id and to an
+	// identity key that no identities Get can resolve. Measured consequence --
+	// ByMember reports ZERO grains for this node, in every process, on the
+	// collector's 30s loop, and removeMemberID stops removing the identity
+	// records of a member that has left. Both are silent; the bucket keeps
+	// filling.
+	//
+	// It is reachable: the id's second half is ActorSystem.ID, which callers
+	// build from the node's own name (actor.WithSystemID), so an FQDN hostname
+	// produces exactly this. Failing here, before any bucket exists, is the
+	// only place it can be said out loud.
+	//
+	// The wildcard bytes need no guard of their own: '*' and '>' are rejected
+	// by nats.go's key validation on the first Put, loudly and immediately
+	// (v1.52.0 jetstream/kv.go, validKeyRe).
+	//
+	// Not conditioned on isClient. A client writes no sub-keys of its own, but
+	// the id is built identically on every node, so a dotted one is a naming
+	// convention that breaks this node's member peers; failing here says so
+	// where it can still be read, instead of leaving it to be discovered on a
+	// member.
+	//
+	// This guard stops IdentityLookup, not the process: Setup returns no error
+	// (Cluster.StartMember calls it and does not check one), so a guarded node
+	// still completes StartMember, still registers into the members bucket via
+	// ClusterProvider.StartMember, and still reports Ready by whatever health
+	// check the deployment uses -- every il.setupErr check downstream is what
+	// actually keeps it from doing useful identity work. That observation
+	// rides forward with the hostname-sanitization question already on file
+	// for the owner (an FQDN hostname is the reachable source of the dot);
+	// resolving that question may make this guard unreachable in practice
+	// without changing what it does when it is reached.
+	if strings.Contains(il.memberID, ".") {
+		il.setupErr = fmt.Errorf(
+			"natskv identity setup failed: member id %q contains '.', which is the tracking "+
+				"sub-key separator: member-scoped tracking reads and member-departure cleanup "+
+				"would silently return nothing. Give the node a name without dots "+
+				"(cluster name %q, actor system id %q)",
+			il.memberID, c.Config.Name, c.ActorSystem.ID)
+		il.identityLogger().Error("natskv identity: refusing to initialize identity lookup for a dotted member id",
+			slog.String("memberID", il.memberID),
+			slog.Any("error", il.setupErr))
+
+		return
+	}
+
 	ctx := context.Background()
 	js := il.provider.js
 	clusterName := c.Config.Name
 
-	// Create the identities KV bucket (no TTL -- activations persist).
-	identities, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:   il.config.identityBucketName(clusterName),
+	// Create the identities KV bucket. Records themselves have no TTL --
+	// activations persist -- but the delete MARKERS they leave behind expire
+	// server-side after TombstoneTTL. Without that, the bucket's retained
+	// message count grows with every identity ever activated instead of with
+	// the live set, and every janitor ListKeys pays transport for the markers
+	// because nats.go filters them client-side.
+	//
+	// The enable is ONE-WAY on an existing bucket: nats-server's stream update
+	// check refuses any config that clears AllowMsgTTL ("message TTL status
+	// can not be disabled"), so a bucket cannot be moved back to
+	// no-marker-TTL in place. That has a sharp operational edge -- reverting
+	// to a build that creates these buckets WITHOUT LimitMarkerTTL makes this
+	// very call fail, i.e. fails Setup, against an already-upgraded bucket.
+	// Rollback is therefore bucket rotation via WithIdentityBucket, which is
+	// already the documented incident lever, not a code revert on its own.
+	//
+	// Re-pushing the config is otherwise safe here because both buckets are
+	// created with ONLY Bucket and Replicas set, so LimitMarkerTTL is the
+	// single KeyValueConfig field that changes -- though nats.go expands it
+	// into TWO stream fields, AllowMsgTTL: true and SubjectDeleteMarkerTTL
+	// (jetstream/kv.go, prepareKeyValueConfig), which is exactly why the
+	// enable is one-way: the refusal above is on clearing AllowMsgTTL.
+	// Enabling it does not make the server start
+	// planting markers of its own: it emits subject-delete markers only when
+	// limits remove the last message on a subject (MaxAge, per-message TTL),
+	// and these buckets set neither -- the only TTL-bearing message they ever
+	// carry is the purge marker the identity delete sites write (casDelete,
+	// removeActivation, RemovePid).
+	identityBucket := il.config.identityBucketName(clusterName)
+	trackingBucket := "protoactor_" + clusterName + "_identities_tracking"
+
+	identities, identityMarkerTTL, err := createBucketWithMarkerTTL(ctx, js, jetstream.KeyValueConfig{
+		Bucket:   identityBucket,
 		Replicas: il.config.Replicas,
-	})
+	}, il.config.TombstoneTTL, il.identityLogger())
 	if err != nil {
 		il.setupErr = fmt.Errorf("natskv identity setup failed: create identities bucket: %w", err)
 		il.identityLogger().Error("natskv identity: failed to create identities bucket",
@@ -228,11 +414,11 @@ func (il *IdentityLookup) Setup(c *cluster.Cluster, kinds []string, isClient boo
 	}
 	il.identities = identities
 
-	// Create the member tracking KV bucket.
-	tracker, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket:   "protoactor_" + clusterName + "_identities_tracking",
+	// Create the member tracking KV bucket, on the same terms.
+	tracker, trackerMarkerTTL, err := createBucketWithMarkerTTL(ctx, js, jetstream.KeyValueConfig{
+		Bucket:   trackingBucket,
 		Replicas: il.config.Replicas,
-	})
+	}, il.config.TombstoneTTL, il.identityLogger())
 	if err != nil {
 		il.setupErr = fmt.Errorf("natskv identity setup failed: create tracking bucket: %w", err)
 		il.identityLogger().Error("natskv identity: failed to create tracking bucket",
@@ -240,6 +426,27 @@ func (il *IdentityLookup) Setup(c *cluster.Cluster, kinds []string, isClient boo
 		return
 	}
 	il.memberTracker = tracker
+
+	// The CONJUNCTION governs: PurgeTTL is attached only if BOTH buckets took
+	// their marker TTL. The two cannot disagree -- same server, same call --
+	// so a disagreement means an assumption broke, and the conjunction is the
+	// safe direction (no PurgeTTL, hence no delete that the server can reject)
+	// whichever bucket it was. Say so when it happens.
+	il.markerTTLEnabled = identityMarkerTTL && trackerMarkerTTL
+	// Per-bucket, for the gauge: the conjunction says whether PurgeTTL is
+	// attached, but only the split says which bucket is retaining markers
+	// forever, and that is what decides whether the documented rotation lever
+	// (WithIdentityBucket, identities bucket only) even applies.
+	il.markerTTLStates = []markerTTLState{
+		{bucket: identityBucket, enabled: identityMarkerTTL},
+		{bucket: trackingBucket, enabled: trackerMarkerTTL},
+	}
+
+	if identityMarkerTTL != trackerMarkerTTL {
+		il.identityLogger().Warn("natskv identity: KV marker TTL support differs between buckets",
+			slog.Bool("identities", identityMarkerTTL),
+			slog.Bool("tracking", trackerMarkerTTL))
+	}
 
 	// Subscribe to ClusterTopology events to clean up when members leave
 	// and to update the strategy manager.
@@ -314,6 +521,56 @@ func (il *IdentityLookup) Setup(c *cluster.Cluster, kinds []string, isClient boo
 	}
 }
 
+// removeActivation is the placement actor's RemoveActivation callback: the
+// normal grain-passivation path. It reads the record, refuses to touch one that
+// no longer points at the PID being removed, and CAS-deletes the rest.
+//
+// A CAS miss is benign and reported as such: ErrKeyExists (the jetstream
+// sentinel carrying JSErrCodeStreamWrongLastSequence) means the record was
+// rewritten by a newer activation after our read, and ErrKeyNotFound means it
+// was already gone. Neither is an error the placement actor can act on.
+func (il *IdentityLookup) removeActivation(
+	ctx context.Context, ci *cluster.ClusterIdentity, pid *actor.PID,
+) error {
+	key := kvKey(ci)
+
+	// Read the entry to validate the PID before deleting.
+	entry, err := il.identities.Get(ctx, key)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return nil
+		}
+		return err
+	}
+
+	var rec activationRecord
+	if err := json.Unmarshal(entry.Value(), &rec); err != nil {
+		return err
+	}
+
+	// Only delete if the stored PID matches.
+	if rec.PidID != pid.Id || rec.PidAddress != pid.Address {
+		return nil
+	}
+
+	if rec.MemberID != "" {
+		il.removeKeyFromMember(ctx, rec.MemberID, key)
+	}
+
+	// CAS delete, as an expiring purge marker. This is the dominant marker
+	// source -- every ordinary passivation lands here, janitor reaps do not --
+	// so leaving it on a plain Delete would keep the bucket growing with every
+	// identity ever activated. See tombstoneOpts for why PurgeTTL is gated.
+	err = il.identities.Purge(ctx, key, il.tombstoneOpts(entry.Revision())...)
+	il.recordIdentityWriteOutcome("removeActivation/delete", true, err)
+	if err != nil {
+		if !errors.Is(err, jetstream.ErrKeyNotFound) && !errors.Is(err, jetstream.ErrKeyExists) {
+			return err
+		}
+	}
+	return nil
+}
+
 // setupPlacementActor spawns the placement actor, proxy actor, and creates
 // the strategy manager for non-client members.
 func (il *IdentityLookup) setupPlacementActor(c *cluster.Cluster) {
@@ -357,47 +614,9 @@ func (il *IdentityLookup) setupPlacementActor(c *cluster.Cluster) {
 		return nil
 	}
 
-	// Create the RemoveActivation callback.
-	removeActivation := func(ctx context.Context, ci *cluster.ClusterIdentity, pid *actor.PID) error {
-		key := kvKey(ci)
-
-		// Read the entry to validate the PID before deleting.
-		entry, err := il.identities.Get(ctx, key)
-		if err != nil {
-			if errors.Is(err, jetstream.ErrKeyNotFound) {
-				return nil
-			}
-			return err
-		}
-
-		var rec activationRecord
-		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
-			return err
-		}
-
-		// Only delete if the stored PID matches.
-		if rec.PidID != pid.Id || rec.PidAddress != pid.Address {
-			return nil
-		}
-
-		if rec.MemberID != "" {
-			il.removeKeyFromMember(ctx, rec.MemberID, key)
-		}
-
-		// CAS delete.
-		err = il.identities.Delete(ctx, key, jetstream.LastRevision(entry.Revision()))
-		il.recordIdentityWriteOutcome("removeActivation/delete", true, err)
-		if err != nil {
-			if !errors.Is(err, jetstream.ErrKeyNotFound) && !errors.Is(err, jetstream.ErrKeyExists) {
-				return err
-			}
-		}
-		return nil
-	}
-
 	config := cluster.PlacementConfig{
 		PersistActivation:     persistActivation,
-		RemoveActivation:      removeActivation,
+		RemoveActivation:      il.removeActivation,
 		CheckActivationRecord: il.checkActivationRecord,
 		CleanupOwnRecord:      il.cleanupOwnRecord,
 		SelfCheckHardReapAge:  il.config.HardReapAge,
@@ -892,9 +1111,10 @@ func (il *IdentityLookup) RemovePid(ci *cluster.ClusterIdentity, pid *actor.PID)
 		il.removeKeyFromMember(ctx, rec.MemberID, key)
 	}
 
-	// Use CAS delete (LastRevision) so the delete only succeeds if the
-	// key hasn't been modified since we read it.
-	err = il.identities.Delete(ctx, key, jetstream.LastRevision(entry.Revision()))
+	// Use CAS delete (LastRevision) so the delete only succeeds if the key
+	// hasn't been modified since we read it, and write it as an expiring purge
+	// marker for the same reason removeActivation does. See tombstoneOpts.
+	err = il.identities.Purge(ctx, key, il.tombstoneOpts(entry.Revision())...)
 	il.recordIdentityWriteOutcome("RemovePid/delete", true, err)
 }
 
@@ -1010,13 +1230,35 @@ func (il *IdentityLookup) getExistingActivationWithRev(ctx context.Context, ci *
 	return &rec, entry.Revision()
 }
 
-// casDelete deletes the given key only if its current revision matches rev.
+// casDelete removes the given key only if its current revision matches rev.
 // A CAS miss (ErrKeyExists from jetstream) is a terminal no-op: the key was
-// modified after our read, so we must not blind-delete. Any error other than
-// ErrKeyNotFound is logged at debug level. Never loops or falls back to
-// unconditional delete.
-func (il *IdentityLookup) casDelete(ctx context.Context, key string, rev uint64, site string) {
-	err := il.identities.Delete(ctx, key, jetstream.LastRevision(rev))
+// modified after our read, so we must not blind-delete. Never loops or falls
+// back to unconditional delete.
+//
+// Purge rather than Delete: Purge is Delete plus KV-Operation: PURGE,
+// Nats-Rollup: sub and a per-message TTL, so the subject collapses to a single
+// marker that the server removes on its own instead of retaining it forever.
+// The rollup discards nothing a reader could still want -- these buckets run at
+// the KV default History of 1, so the subject already holds at most one
+// message. Both LastRevision and PurgeTTL are KVDeleteOpt, so the CAS guard is
+// unaffected, and the server evaluates the expected-revision header before it
+// stores anything, so a rejected purge never rolls the subject up.
+//
+// Returns the Purge error rather than counting a tombstone purge itself: this
+// function has FIFTEEN production call sites and only TWO of them are the
+// janitor's own reap sites (janitor.go's "janitor/hard-reap-lock" and
+// "janitor/absent-member"). The other thirteen -- resolveIdentity's
+// grace/no-target paths, maybeReapLock's owner-absent branch,
+// activateLocal/activateRemote's store-failure cleanups, cleanupOwnRecord and
+// removeMemberID -- fire on ordinary CAS losses, lock steals, activation
+// cleanup and member departure, none of which is the janitor sweeping
+// anything. protocluster_natskv_janitor_tombstone_purge_total's name, HELP
+// text and the runbook all promise a janitor-scoped count, so only the
+// janitor's two call sites record it (see recordTombstonePurge and its two
+// call sites in janitor.go); every other caller is free to ignore the
+// returned error, as thirteen of them do.
+func (il *IdentityLookup) casDelete(ctx context.Context, key string, rev uint64, site string) error {
+	err := il.identities.Purge(ctx, key, il.tombstoneOpts(rev)...)
 	// Control flow is unchanged: casDelete is always a terminal no-op and
 	// never retries or blind-deletes. Only the logging/accounting differs --
 	// the recorder classifies the error (success / benign CAS conflict / real
@@ -1024,6 +1266,34 @@ func (il *IdentityLookup) casDelete(ctx context.Context, key string, rev uint64,
 	// miss (wrong-last-sequence) is benign and Debug-logged; a genuine write
 	// failure is now surfaced at Warn instead of being swallowed at Debug.
 	il.recordIdentityWriteOutcome("casDelete/"+site, true, err)
+
+	return err
+}
+
+// tombstoneOpts builds the delete options every identity delete site uses --
+// casDelete, removeActivation and RemovePid. PurgeTTL is attached ONLY when the
+// bucket actually carries marker TTLs: Purge stamps a Nats-TTL header, and
+// nats-server rejects that header on a stream with AllowMsgTTL: false
+// (JSMessageTTLDisabledErr, "per-message TTL is disabled"). On a bucket that
+// fell back, an unconditional PurgeTTL would make every identity delete fail --
+// passivated identities would never be removed and the write-failure watchdog
+// would fail-stop the process. That is a correctness outage in place of a
+// storage optimisation, so the flag gates the option even though
+// createBucketWithMarkerTTL's fallback is unreachable in today's topologies.
+//
+// LastRevision is always attached: the CAS guard is not negotiable, and both
+// options are KVDeleteOpt, so the rollup does not defeat it. A rejected purge
+// still carries JSErrCodeStreamWrongLastSequence, so classifyWriteError still
+// calls it a benign CAS conflict and removeActivation's ErrKeyExists filter
+// still matches it.
+func (il *IdentityLookup) tombstoneOpts(rev uint64) []jetstream.KVDeleteOpt {
+	opts := []jetstream.KVDeleteOpt{jetstream.LastRevision(rev)}
+
+	if il.markerTTLEnabled && il.config.TombstoneTTL > 0 {
+		opts = append(opts, jetstream.PurgeTTL(il.config.TombstoneTTL))
+	}
+
+	return opts
 }
 
 // tryAcquireLock attempts to acquire an exclusive spawn lock for the given
@@ -1141,169 +1411,464 @@ func (il *IdentityLookup) waitForActivation(ctx context.Context, ci *cluster.Clu
 	return nil
 }
 
-// removeMemberID removes all activations belonging to the given member.
-// It reads the member tracking record, deletes each identity key, then
-// deletes the member record itself.
+// trackingSubKey is one member's claim on one identity. The value is empty:
+// the KEY is the fact.
+//
+// The separator is '.', NOT '/'. NATS KV keys permit both, but only '.' is a
+// SUBJECT separator: ListKeysFiltered turns a filter into the consumer filter
+// subject "$KV.<bucket>." + filter (nats.go jetstream/kv.go, ListKeysFiltered
+// -> WatchFiltered), and a token is the full wildcard only when it is exactly
+// ">". With '/', "memberID/>" is a single literal token that matches nothing --
+// the client's search-key regexp accepts it, the server accepts the subject,
+// and every enumeration silently returns empty. The identity key itself
+// (kvKey(ci) = "kind/identity") keeps its own '/' and is unaffected;
+// TestMemberID_ContainsNoDot pins the one assumption this rests on.
+//
+// This replaces a single per-member JSON array that was read, scanned,
+// re-marshalled and CAS-written on every activation AND every passivation:
+// 262-393 KB per write, 93% of spoke NATS ingress, 13% of entries silently
+// lost to CAS exhaustion, and an approach to the 1 MiB max_payload whose
+// failure mode is os.Exit(70).
+func trackingSubKey(memberID, identityKey string) string {
+	return memberID + "." + identityKey
+}
+
+// trackingMemberFilter is the server-side filter for everything one member
+// holds. Server-side is the point: the cluster collector calls ByMember on a
+// 30s loop in every process, so a client-side walk of the whole bucket would be
+// a new N+1 with N processes multiplying it.
+//
+// It does NOT match the legacy per-member record, whose key is the bare member
+// id: "memberID.>" needs at least one token after the separator. That is why
+// every member-scoped read pairs this enumeration with one Get of the legacy
+// key -- see memberTracking.
+func trackingMemberFilter(memberID string) string {
+	return memberID + ".>"
+}
+
+// trackingKeyMember splits a sub-key back into its member and identity halves.
+// ok == false for a legacy per-member record (no '.'), which is how the read
+// path tells the two shapes apart during the migration release.
+//
+// The split is on the FIRST '.', because the identity half legitimately
+// contains dots -- natskv_charset_test.go round-trips identities such as
+// "a.b.c.d" and "v1.0.3=stable" -- while the member half does not: not because
+// concatenating clusterName + "_" + ActorSystem.ID cannot produce one (an FQDN
+// hostname reaching ActorSystem.ID would), but because Setup's dotted-member-id
+// guard fails Setup loudly, before any bucket exists, on any memberID that
+// contains one. trackingKeyMember runs only on a member that guard let through.
+func trackingKeyMember(key string) (memberID, identityKey string, ok bool) {
+	memberID, identityKey, ok = strings.Cut(key, ".")
+
+	return memberID, identityKey, ok
+}
+
+// memberTracking returns every identity key the tracking bucket says memberID
+// holds, deduplicated, together with the revision of that member's LEGACY
+// record if one is still present -- 0 when there is none, and 0 when there is
+// one this call could not read (see the legacy arm).
+//
+// It reads BOTH shapes and returns their union, and that is a correctness
+// requirement, not tolerance for its own sake. A migration pass that dies
+// between its first Put and its Purge leaves the legacy array AND a prefix of
+// the sub-keys; a grain activated after that point exists only as a sub-key.
+// Reading either shape alone would drop live grains -- from ByMember, which
+// every process calls on a 30s loop, and from member-departure cleanup, which
+// would then leave identity records behind for a member that is gone.
+//
+// Round trips: one filtered enumeration plus one Get, both independent of the
+// member's grain count. The Get is the legacy arm and goes away with it in the
+// release after the one that introduces sub-keys; the enumeration is what this
+// design is for.
+func (il *IdentityLookup) memberTracking(ctx context.Context, memberID string) (keys []string, legacyRev uint64, err error) {
+	lister, err := il.memberTracker.ListKeysFiltered(ctx, trackingMemberFilter(memberID))
+	if err != nil {
+		return nil, 0, err
+	}
+
+	seen := make(map[string]struct{})
+
+	for key := range lister.Keys() {
+		_, identityKey, ok := trackingKeyMember(key)
+		if !ok || identityKey == "" {
+			continue
+		}
+
+		if _, dup := seen[identityKey]; dup {
+			continue
+		}
+
+		seen[identityKey] = struct{}{}
+		keys = append(keys, identityKey)
+	}
+
+	// LEGACY ARM -- delete this block, and memberTracking's second return
+	// value with it, in the release AFTER the one that introduces sub-keys.
+	// Until then a bucket written by the previous release must stay readable.
+	//
+	// Best-effort, in the same direction as the other legacy reader
+	// (expandLegacyMemberRecord, which skips a record it cannot read): the
+	// filtered enumeration above has already answered, and discarding that
+	// answer over a transient Get would abort removeMemberID -- leaving every
+	// identity record of a departed member behind. A bridge record that could
+	// not be read is reported as absent (legacyRev 0), so nothing purges it on
+	// a revision it never saw.
+	entry, getErr := il.memberTracker.Get(ctx, memberID)
+	if getErr != nil {
+		if !errors.Is(getErr, jetstream.ErrKeyNotFound) {
+			il.identityLogger().Warn("natskv identity: legacy member record read failed; continuing with sub-keys",
+				slog.String("memberID", memberID), slog.Any("error", getErr))
+		}
+
+		return keys, 0, nil
+	}
+
+	var mrec memberRecord
+	if jsonErr := json.Unmarshal(entry.Value(), &mrec); jsonErr != nil {
+		il.identityLogger().Error("natskv identity: legacy member record unmarshal failed",
+			slog.String("memberID", memberID), slog.Any("error", jsonErr))
+
+		return keys, 0, nil
+	}
+
+	for _, identityKey := range mrec.Keys {
+		if _, dup := seen[identityKey]; dup {
+			continue
+		}
+
+		seen[identityKey] = struct{}{}
+		keys = append(keys, identityKey)
+	}
+
+	return keys, entry.Revision(), nil
+}
+
+// removeMemberID removes every activation belonging to the given member, and
+// then every trace of that member in the tracking bucket.
+//
+// The second half is not bookkeeping. Under the legacy shape one Delete of the
+// per-member record removed all of a departed member's tracking state; under
+// sub-keys the member's own sub-keys ARE that state, so they have to go with
+// it, or the tracking bucket grows by one key per grain for every member that
+// ever crashed -- unbounded, and each of those keys costs an identities Get on
+// every ListGrains for as long as it exists.
+//
+// Round trips: one filtered enumeration + one legacy Get, then per key one
+// identities Get, at most one identities purge, and one tracking purge. The
+// per-key writes are proportional to the keys being removed, which is what
+// removal costs; nothing here is proportional to the CLUSTER's grain count.
 func (il *IdentityLookup) removeMemberID(ctx context.Context, memberID string) {
 	if il.memberTracker == nil {
 		return
 	}
 
+	keys, legacyRev, err := il.memberTracking(ctx, memberID)
+	if err != nil {
+		il.identityLogger().Error("natskv identity: removeMemberID list tracking failed",
+			slog.String("memberID", memberID), slog.Any("error", err))
+
+		return
+	}
+
+	for _, key := range keys {
+		il.reapDepartedMemberIdentity(ctx, memberID, key)
+		// The member's claim on the key goes whether or not the identity
+		// record was reaped: a record now owned by a live member is not this
+		// member's to hold, and a record that was already gone leaves nothing
+		// to point at.
+		il.purgeTrackingSubKey(ctx, memberID, key, "removeMemberID/purgeSubKey")
+	}
+
+	// LEGACY ARM -- delete with memberTracking's, in the release after the one
+	// that introduces sub-keys. CAS on the revision memberTracking read: an
+	// old-release node may have rewritten the array since.
+	if legacyRev != 0 {
+		il.purgeLegacyMemberRecord(ctx, memberID, legacyRev)
+	}
+}
+
+// reapDepartedMemberIdentity deletes one identity record that a departed member
+// owned.
+//
+// Read the key first to obtain its current revision, then CAS-delete. If the
+// key is absent between the enumeration and this read, skip it (another node
+// already cleaned it up). If the record's MemberID has changed, the key was
+// re-activated by a different member -- skip it (the tracking entry is stale
+// but the new owner is alive). A CAS miss from a concurrent writer is a
+// terminal no-op.
+func (il *IdentityLookup) reapDepartedMemberIdentity(ctx context.Context, memberID, key string) {
+	idEntry, err := il.identities.Get(ctx, key)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return // already gone -- nothing to do
+		}
+
+		il.identityLogger().Error("natskv identity: removeMemberID get identity failed",
+			slog.String("key", key), slog.Any("error", err))
+
+		return
+	}
+
+	var idRec activationRecord
+	if jsonErr := json.Unmarshal(idEntry.Value(), &idRec); jsonErr != nil {
+		il.identityLogger().Error("natskv identity: removeMemberID unmarshal identity failed",
+			slog.String("key", key), slog.Any("error", jsonErr))
+
+		return
+	}
+
+	if idRec.MemberID != memberID {
+		il.identityLogger().Debug("natskv identity: removeMemberID skipping key taken by new member",
+			slog.String("key", key),
+			slog.String("currentOwner", idRec.MemberID),
+			slog.String("removedMember", memberID))
+
+		return
+	}
+
+	il.casDelete(ctx, key, idEntry.Revision(), "removeMemberID")
+}
+
+// addKeyToMember records that memberID holds identityKey. One Put of an empty
+// value, no read-modify-write, therefore no CAS loop and nothing to lose under
+// concurrency.
+//
+// What this replaces: a Get -> unmarshal -> scan -> marshal -> Update of a
+// 262-393 KB JSON array on EVERY activation, retried three times on CAS
+// conflict and then silently abandoned -- 13% of entries lost at the soak's
+// concurrency, 93% of spoke NATS ingress, and a payload converging on the
+// 1 MiB max_payload whose failure mode is os.Exit(70).
+func (il *IdentityLookup) addKeyToMember(ctx context.Context, memberID, key string) {
+	_, err := il.memberTracker.Put(ctx, trackingSubKey(memberID, key), nil)
+	il.recordIdentityWriteOutcome("addKeyToMember/put", false, err)
+}
+
+// removeKeyFromMember drops one member's claim on one identity, at passivation
+// rate.
+func (il *IdentityLookup) removeKeyFromMember(ctx context.Context, memberID, key string) {
+	il.purgeTrackingSubKey(ctx, memberID, key, "removeKeyFromMember/purge")
+}
+
+// purgeTrackingSubKey removes one tracking sub-key, leaving a marker that
+// expires instead of one that is retained forever.
+//
+// Purge, not Delete, for the same reason the identity delete sites use it: a
+// plain Delete's DEL marker is kept until the bucket is rebuilt, and this site
+// runs at passivation rate (113/min on the spoke at soak), so it would
+// reintroduce on the tracking bucket exactly the unbounded-marker defect that
+// was removed from the identities bucket.
+//
+// No CAS, and that is deliberate rather than an omission. tombstoneOpts always
+// attaches LastRevision because an identity record carries state a stale writer
+// could clobber; a tracking sub-key carries NONE -- its value is empty and the
+// key's existence is the entire fact. So:
+//
+//   - There is no read-modify-write to protect. Put means "held", purge means
+//     "not held"; both are total and idempotent, and neither reads first.
+//   - The only ordering that matters, add versus remove of the SAME
+//     (member, identity) pair, is already decided under CAS on the IDENTITIES
+//     bucket. The tracking write follows a decision, it does not make one.
+//   - A tracking write that loses that race leaves a sub-key whose identity
+//     record is gone, which is inert: every reader Gets the identity record and
+//     skips the key when it is missing.
+//   - LastRevision here would make the delete FAIL whenever the revision moved
+//     (a re-activation's Put), turning a benign race into a retained sub-key
+//     plus a logged write failure feeding the fail-stop watchdog. CAS would be
+//     strictly worse, not safer.
+//
+// Purge without a revision never returns ErrKeyNotFound either (nats.go sends
+// no expected-last-sequence header, so the publish always applies), which is
+// why removing a key that was never tracked is a success and not a streak.
+func (il *IdentityLookup) purgeTrackingSubKey(ctx context.Context, memberID, key, site string) {
+	err := il.memberTracker.Purge(ctx, trackingSubKey(memberID, key), il.tombstoneOptsNoCAS()...)
+	il.recordIdentityWriteOutcome(site, true, err)
+}
+
+// tombstoneOptsNoCAS is tombstoneOpts for the sub-key sites: same PurgeTTL,
+// same gate, no LastRevision. See purgeTrackingSubKey for why the CAS guard is
+// absent, and tombstoneOpts for why the TTL is gated on markerTTLEnabled -- a
+// Nats-TTL header on a stream with AllowMsgTTL: false is rejected outright, so
+// an ungated PurgeTTL would make every passivation's tracking delete fail. The
+// flag is the conjunction over BOTH buckets, so it is the correct gate for the
+// tracking bucket too.
+func (il *IdentityLookup) tombstoneOptsNoCAS() []jetstream.KVDeleteOpt {
+	if il.markerTTLEnabled && il.config.TombstoneTTL > 0 {
+		return []jetstream.KVDeleteOpt{jetstream.PurgeTTL(il.config.TombstoneTTL)}
+	}
+
+	return nil
+}
+
+// purgeLegacyMemberRecord removes one previous-release per-member record, under
+// CAS on the revision the caller read.
+//
+// CAS here and not in purgeTrackingSubKey because this key DOES carry state: it
+// is the JSON array, and a node still running the previous release can rewrite
+// it at any moment. Blind-deleting one that was just rewritten would drop every
+// key added to it since the read.
+//
+// It reports whether the record is now gone: a CAS conflict means an
+// old-release node rewrote the array between the read and this purge, so the
+// record is still there and the caller must not report that member finished.
+func (il *IdentityLookup) purgeLegacyMemberRecord(ctx context.Context, memberID string, rev uint64) bool {
+	err := il.memberTracker.Purge(ctx, memberID, il.tombstoneOpts(rev)...)
+
+	// writeSuccess covers "the purge applied" and "the key was already gone",
+	// which are the two shapes of a legacy record that is no longer there.
+	return il.recordIdentityWriteOutcome("legacyMemberRecord/purge", true, err) == writeSuccess
+}
+
+// migrateLegacyMemberRecords fans the previous release's per-member JSON arrays
+// out into sub-keys and purges each array once its keys are durable. It
+// reports whether the bucket is free of every legacy record THE PASS
+// ENUMERATED before its own deadline -- not whether the bucket is free of
+// legacy records, full stop. A deadline that fires mid-enumeration closes the
+// key lister's channel before every record has even been observed, so the
+// pass has nothing to report pending for a record it never reached; it must
+// therefore report itself unfinished on ctx.Err() alone, regardless of what it
+// did or did not see. Only a pass that both saw and finished every record it
+// enumerated lets its driver stop calling it.
+//
+// Idempotent and best-effort, and bounded twice over: maxMigrationPutsPerSetup
+// writes and migrationDeadline of wall clock per pass. A member whose fan-out
+// does not finish keeps its legacy record and is picked up by the next pass;
+// nothing is lost either way, because the read path returns the UNION of both
+// shapes for this whole release (see memberTracking).
+//
+// The crash windows, stated:
+//
+//   - Died between two Puts: legacy record intact, sub-keys a prefix of it. The
+//     union is complete; the next pass re-Puts the prefix (idempotent) and
+//     finishes.
+//   - Died after the last Put, before the Purge: legacy record intact,
+//     sub-keys complete. The union is complete AND duplicated, which is why
+//     memberTracking deduplicates. The next pass re-Puts and purges.
+//   - Died after the Purge: only sub-keys, which is the finished state.
+//
+// In no window is a key visible in neither shape, and in no window does a key
+// appear twice in a caller's result.
+func (il *IdentityLookup) migrateLegacyMemberRecords(parent context.Context) bool {
+	if il.memberTracker == nil {
+		return true
+	}
+
+	// Own deadline, and cancel on the way out. The cancel is NOT what makes
+	// abandoning the enumeration safe -- see the drain below; it bounds the
+	// pass's own work.
+	ctx, cancel := context.WithTimeout(parent, migrationDeadline)
+	defer cancel()
+
+	lister, err := il.memberTracker.ListKeys(ctx)
+	if err != nil {
+		il.identityLogger().Warn("natskv identity: tracking migration list failed", slog.Any("error", err))
+
+		return false
+	}
+
+	writes := 0
+	pending := 0
+
+	// The enumeration is DRAINED, never abandoned: once the pass stops doing
+	// work it keeps reading to exhaustion, and a key it will not process is
+	// counted as pending instead of breaking the range.
+	//
+	// nats.go's key lister runs a goroutine forwarding keys into a 256-entry
+	// buffered channel, and that send sits OUTSIDE the select that watches the
+	// context (v1.52.0 jetstream/kv.go:1414-1423). A consumer that stops
+	// ranging therefore parks it forever as soon as the buffer fills:
+	// cancelling ctx cannot reach a goroutine that is not in the select, and
+	// the deferred watcher.Stop() it holds never runs, so the server-side
+	// consumer leaks with the goroutine. On this path that is one goroutine and
+	// one consumer per janitor tick, for as long as the migration keeps being
+	// capped. Every other lister site in this package drains for the same
+	// reason. Draining costs only channel receives: no Get, no Put, no probe.
+	for key := range lister.Keys() {
+		if _, _, isSubKey := trackingKeyMember(key); isSubKey {
+			continue // already fanned out; costs nothing to skip
+		}
+
+		if writes >= maxMigrationPutsPerSetup || ctx.Err() != nil {
+			pending++
+
+			continue
+		}
+
+		if !il.fanOutLegacyMemberRecord(ctx, key, &writes) {
+			pending++
+		}
+	}
+
+	if pending > 0 || ctx.Err() != nil {
+		il.identityLogger().Info("natskv identity: tracking migration paused; resuming next pass",
+			slog.Int("writes", writes),
+			slog.Int("pending", pending),
+			slog.Any("ctxErr", ctx.Err()))
+
+		return false
+	}
+
+	if writes > 0 {
+		il.identityLogger().Info("natskv identity: tracking migration complete",
+			slog.Int("writes", writes))
+	}
+
+	return true
+}
+
+// fanOutLegacyMemberRecord expands one legacy per-member record into sub-keys
+// and purges it. It reports whether that member is finished; false leaves the
+// legacy record in place for the next pass.
+func (il *IdentityLookup) fanOutLegacyMemberRecord(ctx context.Context, memberID string, writes *int) bool {
 	entry, err := il.memberTracker.Get(ctx, memberID)
 	if err != nil {
-		return
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return true // another node fanned it out first
+		}
+
+		il.identityLogger().Warn("natskv identity: tracking migration get failed",
+			slog.String("memberID", memberID), slog.Any("error", err))
+
+		return false
 	}
 
 	var mrec memberRecord
-	if err := json.Unmarshal(entry.Value(), &mrec); err != nil {
-		il.identityLogger().Error("natskv identity: removeMemberID unmarshal failed",
-			slog.String("memberID", memberID), slog.Any("error", err))
-		return
+	if jsonErr := json.Unmarshal(entry.Value(), &mrec); jsonErr != nil {
+		// Not a record any retry can read. Reporting it pending would keep the
+		// migration running forever over a key it can never finish, so it is
+		// surfaced loudly and treated as done; the read path already skips a
+		// tracking value it cannot unmarshal.
+		il.identityLogger().Error("natskv identity: tracking migration cannot read legacy record",
+			slog.String("memberID", memberID), slog.Any("error", jsonErr))
+
+		return true
 	}
 
-	// Delete each identity key belonging to this member.
-	// Read each key first to obtain its current revision, then CAS-delete.
-	// If the key is absent between the list read and this read, skip it
-	// (another node already cleaned it up). If the record's MemberID has
-	// changed, the key was re-activated by a different member -- skip it
-	// (the tracking list is stale but the new owner is alive). A CAS miss
-	// from a concurrent writer is a terminal no-op.
-	for _, key := range mrec.Keys {
-		idEntry, err := il.identities.Get(ctx, key)
-		if err != nil {
-			if errors.Is(err, jetstream.ErrKeyNotFound) {
-				continue // already gone -- nothing to do
-			}
-			il.identityLogger().Error("natskv identity: removeMemberID get identity failed",
-				slog.String("key", key), slog.Any("error", err))
-			continue
+	for _, identityKey := range mrec.Keys {
+		if *writes >= maxMigrationPutsPerSetup || ctx.Err() != nil {
+			return false
 		}
-		// Validate that the stored record still belongs to this member.
-		// If another member has re-activated the grain, leave it alone.
-		var idRec activationRecord
-		if jsonErr := json.Unmarshal(idEntry.Value(), &idRec); jsonErr != nil {
-			il.identityLogger().Error("natskv identity: removeMemberID unmarshal identity failed",
-				slog.String("key", key), slog.Any("error", jsonErr))
-			continue
+
+		if _, putErr := il.memberTracker.Put(ctx, trackingSubKey(memberID, identityKey), nil); putErr != nil {
+			il.identityLogger().Warn("natskv identity: tracking migration put failed",
+				slog.String("memberID", memberID),
+				slog.String("key", identityKey),
+				slog.Any("error", putErr))
+
+			return false // leave the legacy record for the next attempt
 		}
-		if idRec.MemberID != memberID {
-			il.identityLogger().Debug("natskv identity: removeMemberID skipping key taken by new member",
-				slog.String("key", key),
-				slog.String("currentOwner", idRec.MemberID),
-				slog.String("removedMember", memberID))
-			continue
-		}
-		il.casDelete(ctx, key, idEntry.Revision(), "removeMemberID")
+
+		*writes++
 	}
 
-	// Delete the member tracking record itself.
-	err = il.memberTracker.Delete(ctx, memberID)
-	il.recordIdentityWriteOutcome("removeMemberID/deleteMember", true, err)
-}
-
-// addKeyToMember adds an identity key to a member's tracking record.
-// Uses a CAS-loop with retry on conflict.
-func (il *IdentityLookup) addKeyToMember(ctx context.Context, memberID, key string) {
-	for i := 0; i < 3; i++ {
-		entry, err := il.memberTracker.Get(ctx, memberID)
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			// Create a new member record.
-			mrec := memberRecord{Keys: []string{key}}
-			data, err := json.Marshal(&mrec)
-			if err != nil {
-				il.identityLogger().Error("natskv identity: addKeyToMember marshal failed",
-					slog.String("memberID", memberID), slog.Any("error", err))
-				return
-			}
-			_, err = il.memberTracker.Create(ctx, memberID, data)
-			il.recordIdentityWriteOutcome("addKeyToMember/create", false, err)
-			if err == nil {
-				return
-			}
-			if errors.Is(err, jetstream.ErrKeyExists) {
-				// Another goroutine created it first -- retry with update.
-				continue
-			}
-			return
-		}
-		if err != nil {
-			il.identityLogger().Error("natskv identity: addKeyToMember get failed",
-				slog.String("memberID", memberID), slog.Any("error", err))
-			return
-		}
-
-		var mrec memberRecord
-		if err := json.Unmarshal(entry.Value(), &mrec); err != nil {
-			il.identityLogger().Error("natskv identity: addKeyToMember unmarshal failed",
-				slog.String("memberID", memberID), slog.Any("error", err))
-			return
-		}
-
-		// Check if key already exists.
-		for _, k := range mrec.Keys {
-			if k == key {
-				return
-			}
-		}
-
-		mrec.Keys = append(mrec.Keys, key)
-		data, err := json.Marshal(&mrec)
-		if err != nil {
-			il.identityLogger().Error("natskv identity: addKeyToMember marshal failed",
-				slog.String("memberID", memberID), slog.Any("error", err))
-			return
-		}
-
-		_, err = il.memberTracker.Update(ctx, memberID, data, entry.Revision())
-		il.recordIdentityWriteOutcome("addKeyToMember/update", false, err)
-		if err == nil {
-			return
-		}
-		// CAS conflict -- retry.
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// removeKeyFromMember removes an identity key from a member's tracking record.
-// Uses a CAS-loop with retry on conflict.
-func (il *IdentityLookup) removeKeyFromMember(ctx context.Context, memberID, key string) {
-	for i := 0; i < 3; i++ {
-		entry, err := il.memberTracker.Get(ctx, memberID)
-		if err != nil {
-			return
-		}
-
-		var mrec memberRecord
-		if err := json.Unmarshal(entry.Value(), &mrec); err != nil {
-			il.identityLogger().Error("natskv identity: removeKeyFromMember unmarshal failed",
-				slog.String("memberID", memberID), slog.Any("error", err))
-			return
-		}
-
-		// Filter out the key.
-		filtered := make([]string, 0, len(mrec.Keys))
-		for _, k := range mrec.Keys {
-			if k != key {
-				filtered = append(filtered, k)
-			}
-		}
-		mrec.Keys = filtered
-
-		data, err := json.Marshal(&mrec)
-		if err != nil {
-			il.identityLogger().Error("natskv identity: removeKeyFromMember marshal failed",
-				slog.String("memberID", memberID), slog.Any("error", err))
-			return
-		}
-
-		_, err = il.memberTracker.Update(ctx, memberID, data, entry.Revision())
-		il.recordIdentityWriteOutcome("removeKeyFromMember/update", false, err)
-		if err == nil {
-			return
-		}
-		// CAS conflict -- retry.
-		time.Sleep(10 * time.Millisecond)
-	}
+	// Purge the legacy record only once every one of its keys is durable. A
+	// partial fan-out keeps it and the next pass resumes: the Puts are
+	// idempotent, so re-writing the ones already done costs writes, not
+	// correctness.
+	//
+	// A failed or CAS-lost purge leaves the record in the bucket, so this
+	// member is NOT finished. Reporting it finished would let the caller latch
+	// "migration complete" over a bucket that still holds legacy records.
+	return il.purgeLegacyMemberRecord(ctx, memberID, entry.Revision())
 }
 
 // handleActivationRequest is the NATS subscription handler for client-initiated
@@ -1533,6 +2098,21 @@ func pidFromRecord(rec *activationRecord) *actor.PID {
 var _ cluster.GrainEnumerator = (*IdentityLookup)(nil)
 
 // ListGrains returns all known grain activations across all members.
+//
+// One enumeration of the whole tracking bucket, grouped by the member half of
+// each sub-key -- where the legacy shape needed one enumeration of the member
+// keys plus one Get of each member's array.
+//
+// Its per-identity fan-out is RETAINED, deliberately: one identities Get per
+// tracking key, O(all live identities), unbounded. ListGrains is an
+// operator/admin enumeration, not a hot path. The reader that runs
+// continuously is the cluster collector's 30s loop, and that calls ByMember,
+// which this design reduces to O(that member's grains); the collector also
+// caps itself at 5000 grains and skips enumeration entirely above it. Bounding
+// ListGrains would mean a values-watcher rewrite of the read shape in the same
+// release as a bucket-shape migration, or truncating an operator's view of the
+// cluster. TestListGrains_FanoutIsProportionalToLiveKeys puts the number on
+// the record rather than assuming it away.
 func (il *IdentityLookup) ListGrains() ([]*cluster.GrainInfo, error) {
 	if il.setupErr != nil {
 		return nil, il.setupErr
@@ -1540,24 +2120,90 @@ func (il *IdentityLookup) ListGrains() ([]*cluster.GrainInfo, error) {
 
 	ctx := context.Background()
 
-	memberKeys, err := il.memberTracker.Keys(ctx)
-	if errors.Is(err, jetstream.ErrNoKeysFound) {
-		return nil, nil
-	}
+	// No ErrNoKeysFound branch: that sentinel belongs to the legacy
+	// KeyValue.Keys() API. jetstream's ListKeys reports an empty bucket as an
+	// enumeration that yields nothing (v1.52.0 jetstream/kv.go:1403-1427), which
+	// this loop already handles -- TestListGrains_EmptyBucketIsNotAnError pins it.
+	lister, err := il.memberTracker.ListKeys(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("natskv identity: list member keys: %w", err)
+		return nil, fmt.Errorf("natskv identity: list tracking keys: %w", err)
+	}
+
+	// Member order follows first appearance in the enumeration rather than map
+	// iteration, so the result is stable for a given bucket state.
+	var order []string
+
+	byMember := make(map[string][]string)
+	seen := make(map[string]struct{})
+
+	var legacyMembers []string
+
+	add := func(memberID, identityKey string) {
+		if identityKey == "" {
+			return
+		}
+
+		dedupe := memberID + "\x00" + identityKey
+		if _, dup := seen[dedupe]; dup {
+			return
+		}
+
+		seen[dedupe] = struct{}{}
+
+		if _, known := byMember[memberID]; !known {
+			order = append(order, memberID)
+		}
+
+		byMember[memberID] = append(byMember[memberID], identityKey)
+	}
+
+	for key := range lister.Keys() {
+		memberID, identityKey, ok := trackingKeyMember(key)
+		if !ok {
+			// LEGACY ARM -- a key with no '.' is a previous-release per-member
+			// record. Delete this arm, and expandLegacyMemberRecord with it,
+			// in the release after the one that introduces sub-keys.
+			legacyMembers = append(legacyMembers, key)
+
+			continue
+		}
+
+		add(memberID, identityKey)
+	}
+
+	for _, memberID := range legacyMembers {
+		il.expandLegacyMemberRecord(ctx, memberID, add)
 	}
 
 	var result []*cluster.GrainInfo
-	for _, memberID := range memberKeys {
-		grains, err := il.listMemberGrains(ctx, memberID)
-		if err != nil {
-			continue
-		}
-		result = append(result, grains...)
+
+	for _, memberID := range order {
+		result = append(result, il.grainInfosFor(ctx, memberID, byMember[memberID])...)
 	}
 
 	return result, nil
+}
+
+// expandLegacyMemberRecord reads one previous-release per-member array and
+// feeds its keys to add. One Get per legacy member -- bounded by the member
+// count, not the grain count, and only until the migration has run.
+func (il *IdentityLookup) expandLegacyMemberRecord(ctx context.Context, memberID string, add func(memberID, identityKey string)) {
+	entry, err := il.memberTracker.Get(ctx, memberID)
+	if err != nil {
+		return
+	}
+
+	var mrec memberRecord
+	if jsonErr := json.Unmarshal(entry.Value(), &mrec); jsonErr != nil {
+		il.identityLogger().Error("natskv identity: legacy member record unmarshal failed",
+			slog.String("memberID", memberID), slog.Any("error", jsonErr))
+
+		return
+	}
+
+	for _, identityKey := range mrec.Keys {
+		add(memberID, identityKey)
+	}
 }
 
 // ListGrainsByKind returns grain activations filtered by kind.
@@ -1576,6 +2222,13 @@ func (il *IdentityLookup) ListGrainsByKind(kind string) ([]*cluster.GrainInfo, e
 }
 
 // ListGrainsByMember returns grain activations owned by a specific member.
+//
+// This is the collector's 30s call, in every process. It costs one SERVER-SIDE
+// filtered enumeration scoped to the member, plus one Get per grain that member
+// holds -- where the legacy shape first read that member's whole 262-393 KB
+// array. A member that holds nothing enumerates empty and returns (nil, nil);
+// under the legacy shape it returned ErrKeyNotFound, which callers had to
+// special-case.
 func (il *IdentityLookup) ListGrainsByMember(memberID string) ([]*cluster.GrainInfo, error) {
 	if il.setupErr != nil {
 		return nil, il.setupErr
@@ -1586,25 +2239,28 @@ func (il *IdentityLookup) ListGrainsByMember(memberID string) ([]*cluster.GrainI
 // listMemberGrains reads all activation records belonging to a specific member
 // from the member tracker and identities buckets.
 func (il *IdentityLookup) listMemberGrains(ctx context.Context, memberID string) ([]*cluster.GrainInfo, error) {
-	entry, err := il.memberTracker.Get(ctx, memberID)
+	keys, _, err := il.memberTracking(ctx, memberID)
 	if err != nil {
 		return nil, err
 	}
 
-	var mrec memberRecord
-	if err := json.Unmarshal(entry.Value(), &mrec); err != nil {
-		return nil, err
-	}
+	return il.grainInfosFor(ctx, memberID, keys), nil
+}
 
+// grainInfosFor turns identity keys into GrainInfos, one identities Get each.
+// A key whose record is missing, unreadable, or still lock-only (no PID) is
+// skipped: it is not an activation anyone can talk to.
+func (il *IdentityLookup) grainInfosFor(ctx context.Context, memberID string, keys []string) []*cluster.GrainInfo {
 	var result []*cluster.GrainInfo
-	for _, key := range mrec.Keys {
+
+	for _, key := range keys {
 		idEntry, err := il.identities.Get(ctx, key)
 		if err != nil {
 			continue
 		}
 
 		var rec activationRecord
-		if err := json.Unmarshal(idEntry.Value(), &rec); err != nil {
+		if jsonErr := json.Unmarshal(idEntry.Value(), &rec); jsonErr != nil {
 			continue
 		}
 
@@ -1615,7 +2271,7 @@ func (il *IdentityLookup) listMemberGrains(ctx context.Context, memberID string)
 		// kvKey produces "kind/identity"; split on the first '/' so that
 		// identities containing '/' round-trip correctly. Kind names are
 		// validated to never contain '/' (see cluster.ValidateKindName).
-		// Reverse the ':'->'_' substitution applied by kvKey is NOT possible
+		// Reversing the ':'->'_' substitution applied by kvKey is NOT possible
 		// here without losing fidelity for identities that legitimately
 		// contained '_' — kinds and identities with ':' will surface here as
 		// the post-substitution form, which is consistent with how they were
@@ -1629,7 +2285,7 @@ func (il *IdentityLookup) listMemberGrains(ctx context.Context, memberID string)
 		})
 	}
 
-	return result, nil
+	return result
 }
 
 // Peek checks if a grain activation exists without triggering activation.

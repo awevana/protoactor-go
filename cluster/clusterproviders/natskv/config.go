@@ -22,6 +22,42 @@ const (
 	defaultWaiterWindow          = 15 * time.Second
 	defaultJanitorInterval       = 30 * time.Second
 
+	// defaultTombstoneTTL is how long a deleted identity's marker is retained
+	// before the server removes it. Without a TTL the marker is retained
+	// forever and the identities bucket's message count grows with every
+	// identity ever activated, not with the live set: 2,160 markers against
+	// 4,856 live keys on the hub at soak, +46/min. One hour is far longer than
+	// any reader that could race a delete -- the only reader of the identities
+	// bucket that watches for delete markers is waitForActivation, bounded by
+	// WaiterWindow (15s) -- and short enough that the marker set tracks grain
+	// churn rather than uptime.
+	defaultTombstoneTTL = time.Hour
+
+	// minTombstoneTTL is the server's floor for a subject-delete-marker TTL
+	// (nats-server server/stream.go: "subject delete marker TTL must be at
+	// least 1 second"). Below it, bucket creation fails with
+	// JSStreamInvalidConfig -- which is NOT ErrLimitMarkerTTLNotSupported and
+	// so would NOT take createBucketWithMarkerTTL's fallback, turning a
+	// mis-set knob into a startup outage. It governs EVERY LimitMarkerTTL this
+	// package sets -- the identity buckets' TombstoneTTL and the provider's
+	// member/leader buckets, whose marker TTL is their key TTL -- via
+	// clampMarkerTTL.
+	minTombstoneTTL = time.Second
+
+	// maxMigrationPutsPerSetup bounds the legacy tracking fan-out per pass.
+	// The legacy record's Keys slice is the 262-393 KB array the sub-key shape
+	// removes -- tens of thousands of entries per member on the spoke -- and
+	// the fan-out runs on the leader's maintenance loop, so an unbounded loop
+	// is one long write storm on a live cluster. A member that does not finish
+	// keeps its legacy record and resumes on the next pass; the read path
+	// returns the union of both shapes for this whole release, so a paused
+	// migration loses nothing.
+	maxMigrationPutsPerSetup = 2000
+
+	// migrationDeadline bounds the same loop in wall clock, for the case where
+	// the writes are slow rather than numerous.
+	migrationDeadline = 10 * time.Second
+
 	defaultWriteFailureThreshold = 15
 	defaultWriteFailureWindow    = 90 * time.Second
 	defaultRemoteActivationTO    = 12 * time.Second
@@ -71,6 +107,14 @@ type config struct {
 	// JanitorInterval is the cadence at which the background janitor
 	// scans for and removes stale identity records.
 	JanitorInterval time.Duration
+
+	// TombstoneTTL is how long the server retains the delete marker a removed
+	// identity leaves behind, before expiring it on its own. It is applied
+	// twice: as the bucket's LimitMarkerTTL at creation, and as the per-message
+	// PurgeTTL on every identity delete (casDelete, removeActivation,
+	// RemovePid). A value <= 0 opts out entirely and restores the previous
+	// behaviour of markers that are retained forever.
+	TombstoneTTL time.Duration
 
 	// WriteFailureThreshold is the number of consecutive non-benign identity
 	// write failures required to trip the fail-stop watchdog. CAS conflicts
@@ -193,6 +237,33 @@ func WithJanitorInterval(d time.Duration) Option {
 	return func(c *config) { c.JanitorInterval = d }
 }
 
+// clampMarkerTTL raises a positive marker TTL to the server's floor and
+// normalises anything non-positive to "no marker TTL". Every LimitMarkerTTL
+// this package sets goes through it: the server rejects a sub-second
+// SubjectDeleteMarkerTTL with JSStreamInvalidConfig, which is a bucket-creation
+// failure -- i.e. a startup outage -- rather than a capability error that
+// something could fall back from.
+func clampMarkerTTL(d time.Duration) time.Duration {
+	switch {
+	case d <= 0:
+		return 0
+	case d < minTombstoneTTL:
+		return minTombstoneTTL
+	default:
+		return d
+	}
+}
+
+// WithTombstoneTTL sets how long the server retains a deleted identity's
+// marker before expiring it. A value <= 0 disables marker expiry, restoring
+// markers that are retained forever. A positive value below the server's
+// one-second floor is clamped to minTombstoneTTL rather than being passed
+// through, because the server rejects a shorter marker TTL outright and that
+// rejection would fail Setup instead of degrading.
+func WithTombstoneTTL(d time.Duration) Option {
+	return func(c *config) { c.TombstoneTTL = clampMarkerTTL(d) }
+}
+
 // WithWriteFailureThreshold sets the number of consecutive non-benign identity
 // write failures required to trip the fail-stop watchdog. A value <= 0 leaves
 // the default in place.
@@ -254,6 +325,7 @@ func newDefaultConfig() *config {
 		ActivationAbsentGrace:   defaultActivationAbsentGrace,
 		WaiterWindow:            defaultWaiterWindow,
 		JanitorInterval:         defaultJanitorInterval,
+		TombstoneTTL:            defaultTombstoneTTL,
 		WriteFailureThreshold:   defaultWriteFailureThreshold,
 		WriteFailureWindow:      defaultWriteFailureWindow,
 		RemoteActivationTimeout: defaultRemoteActivationTO,
