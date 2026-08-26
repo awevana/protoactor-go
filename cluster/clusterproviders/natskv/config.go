@@ -22,6 +22,20 @@ const (
 	defaultWaiterWindow          = 15 * time.Second
 	defaultJanitorInterval       = 30 * time.Second
 
+	// defaultStartStepTimeout bounds each startup step that performs I/O
+	// (bucket ensure, register-self Put, the initial member load with its
+	// step-scoped watch establishment and history drain, leader-election
+	// join; NOT the long-lived watches -- see StartStepTimeout). It
+	// deliberately exceeds the nats.go implicit per-call default (5s on a
+	// deadline-less context: jetstream.defaultAPITimeout on the API calls,
+	// the legacy JS context's MaxWait on watch establishment) that it
+	// replaces, so no boot that used to succeed inside the client's own
+	// bound can newly fail -- while a wedged server fails the step in
+	// seconds, with the step, bucket, key, and elapsed time in the error.
+	// The one startup wait the client never bounds -- the post-establishment
+	// history drain in the initial member load -- is bounded only by this.
+	defaultStartStepTimeout = 10 * time.Second
+
 	// defaultTombstoneTTL is how long a deleted identity's marker is retained
 	// before the server removes it. Without a TTL the marker is retained
 	// forever and the identities bucket's message count grows with every
@@ -138,6 +152,30 @@ type config struct {
 	// round-trip. It must exceed the member-side spawn budget (placement RPC),
 	// which can legitimately take ~10s+. It is independent of LockTTL.
 	RemoteActivationTimeout time.Duration
+
+	// StartStepTimeout is the provider-owned bound on each StartMember /
+	// StartClient step that performs I/O: member and leader bucket ensure,
+	// the register-self Put, the initial member load (its step-scoped watch
+	// establishment plus history drain), and the leader-election join. Each
+	// step runs under its own context.WithTimeout derived from the provider
+	// context, so an earlier provider-context cancellation still wins.
+	//
+	// It deliberately does NOT cover the long-lived watches
+	// (keepWatching, keepWatchingLeader) -- neither their establishment nor
+	// any re-establishment after a respin: the context handed to a KV Watch
+	// governs the subscription's whole lifetime (nats.go v1.52.0
+	// js.go:2050-2055 unsubscribes the moment that context is done), so a
+	// deadline there would kill every live watcher when it expired. Those
+	// establishments still carry the client's own ~5s cap (the legacy JS
+	// context's MaxWait, applied to a deadline-less context by
+	// getJSContextOpts).
+	//
+	// A value <= 0 disables the provider-owned bound: steps then fall back
+	// to whatever bound the client library applies (nats.go caps KV
+	// Put/ensure calls and watch establishment on a deadline-less context
+	// at its implicit 5s default; the post-establishment history drain of
+	// the initial member load is then unbounded).
+	StartStepTimeout time.Duration
 }
 
 // Option configures the NATS KV cluster provider.
@@ -237,6 +275,18 @@ func WithJanitorInterval(d time.Duration) Option {
 	return func(c *config) { c.JanitorInterval = d }
 }
 
+// WithStartStepTimeout sets the provider-owned bound on each startup step
+// that performs I/O (bucket ensure, register-self Put, the initial member
+// load with its step-scoped watch establishment and history drain,
+// leader-election join). It does not bound the long-lived watches -- see
+// the StartStepTimeout field doc for why that is deliberate. A value <= 0
+// disables the provider-owned bound, leaving each step to whatever bound
+// the client library applies (an implicit ~5s per call; the history drain
+// then unbounded).
+func WithStartStepTimeout(d time.Duration) Option {
+	return func(c *config) { c.StartStepTimeout = d }
+}
+
 // clampMarkerTTL raises a positive marker TTL to the server's floor and
 // normalises anything non-positive to "no marker TTL". Every LimitMarkerTTL
 // this package sets goes through it: the server rejects a sub-second
@@ -329,6 +379,7 @@ func newDefaultConfig() *config {
 		WriteFailureThreshold:   defaultWriteFailureThreshold,
 		WriteFailureWindow:      defaultWriteFailureWindow,
 		RemoteActivationTimeout: defaultRemoteActivationTO,
+		StartStepTimeout:        defaultStartStepTimeout,
 		// FailStop is intentionally left nil here. The nil value is a lazy
 		// sentinel: tripFailStop resolves it to defaultFailStop at trip time,
 		// not at Setup time, so the logger and leadership state are current

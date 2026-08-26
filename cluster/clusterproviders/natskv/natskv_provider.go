@@ -337,7 +337,11 @@ func (p *Provider) UpdateKinds(kinds []string) error {
 func (p *Provider) createMemberBucket() error {
 	bucketName := p.config.memberBucketName(p.clusterName)
 
-	kv, err := p.js.CreateOrUpdateKeyValue(p.ctx, jetstream.KeyValueConfig{
+	start := time.Now()
+	ctx, cancel := p.startStepContext()
+	defer cancel()
+
+	kv, err := p.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:   bucketName,
 		Replicas: p.config.Replicas,
 		TTL:      p.config.MemberTTL,
@@ -345,7 +349,8 @@ func (p *Provider) createMemberBucket() error {
 		LimitMarkerTTL: clampMarkerTTL(p.config.MemberTTL),
 	})
 	if err != nil {
-		return fmt.Errorf("natskv: create member bucket %q: %w", bucketName, err)
+		return fmt.Errorf("natskv: create member bucket %q: %w (elapsed %s)",
+			bucketName, err, stepElapsed(start))
 	}
 
 	p.memberBucket = kv
@@ -359,18 +364,54 @@ func (p *Provider) createMemberBucket() error {
 func (p *Provider) createLeaderBucket() error {
 	bucketName := p.config.memberBucketName(p.clusterName) + "_leader"
 
-	kv, err := p.js.CreateOrUpdateKeyValue(p.ctx, jetstream.KeyValueConfig{
+	start := time.Now()
+	ctx, cancel := p.startStepContext()
+	defer cancel()
+
+	kv, err := p.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket:         bucketName,
 		Replicas:       p.config.Replicas,
 		TTL:            p.config.LeaderTTL,
 		LimitMarkerTTL: clampMarkerTTL(p.config.LeaderTTL),
 	})
 	if err != nil {
-		return fmt.Errorf("natskv: create leader bucket %q: %w", bucketName, err)
+		return fmt.Errorf("natskv: create leader bucket %q: %w (elapsed %s)",
+			bucketName, err, stepElapsed(start))
 	}
 
 	p.leaderBucket = kv
 	return nil
+}
+
+// startStepContext bounds one startup step that performs I/O. The context is
+// derived from the provider context, so an earlier cancellation (Shutdown)
+// still wins; the StartStepTimeout deadline replaces the client library's
+// hidden per-call default (nats.go caps KV calls -- watch establishment
+// included, via the legacy JS context's MaxWait -- on a deadline-less
+// context at its implicit 5s; the one wait it never bounds is the
+// post-establishment history drain), making the bound provider-owned and
+// configurable. A non-positive StartStepTimeout disables the deadline and
+// restores the client's own behaviour.
+//
+// It must NOT be used for the long-lived watches (keepWatching,
+// keepWatchingLeader): the context passed to a KV Watch governs the
+// subscription's whole lifetime -- nats.go unsubscribes the underlying
+// subscription as soon as that context is done (js.Subscribe's ctx-done
+// goroutine, nats.go v1.52.0 js.go:2050-2055) -- so a deadline there would
+// kill every live watcher when it expired. loadInitialMembers is safe
+// because its watcher is scoped to the step and stopped before the step
+// returns.
+func (p *Provider) startStepContext() (context.Context, context.CancelFunc) {
+	if p.config.StartStepTimeout <= 0 {
+		return context.WithCancel(p.ctx)
+	}
+	return context.WithTimeout(p.ctx, p.config.StartStepTimeout)
+}
+
+// stepElapsed renders how long a failed startup step ran, for step errors.
+// Millisecond precision is plenty for triage and keeps the message short.
+func stepElapsed(start time.Time) time.Duration {
+	return time.Since(start).Round(time.Millisecond)
 }
 
 // memberKey returns the full KV key for a member.
@@ -385,6 +426,13 @@ func (p *Provider) leaderKey() string {
 
 // registerSelf writes the member key to the KV bucket. The bucket-level TTL
 // handles expiration; startRefresh re-puts the key periodically to keep it alive.
+//
+// The Put runs under the provider-owned step timeout (it also bounds the
+// re-registration UpdateKinds performs), and a failure names the step, the
+// key, the bucket, and the elapsed time: a bare "register self: context
+// deadline exceeded" -- the client's own hidden bound on a deadline-less
+// context, with nothing to say which bucket or how long -- has twice turned a
+// server-side JetStream wedge into hours of client-side triage.
 func (p *Provider) registerSelf() error {
 	p.membersMu.RLock()
 	data, err := p.self.Serialize()
@@ -394,9 +442,15 @@ func (p *Provider) registerSelf() error {
 	}
 
 	key := p.memberKey(p.self.ID)
-	_, err = p.memberBucket.Put(p.ctx, key, data)
+
+	start := time.Now()
+	ctx, cancel := p.startStepContext()
+	defer cancel()
+
+	_, err = p.memberBucket.Put(ctx, key, data)
 	if err != nil {
-		return fmt.Errorf("natskv: register self: %w", err)
+		return fmt.Errorf("natskv: register self: put key %q to bucket %q: %w (elapsed %s)",
+			key, p.config.memberBucketName(p.clusterName), err, stepElapsed(start))
 	}
 
 	return nil
@@ -405,27 +459,66 @@ func (p *Provider) registerSelf() error {
 // loadInitialMembers reads all existing member keys from the KV bucket.
 // It uses IncludeHistory to get all current values. The watcher sends nil
 // as a sentinel value to indicate the end of initial values.
+//
+// The whole step -- watch establishment plus the history drain -- runs under
+// the provider-owned step timeout. Establishment already carries the
+// client's own cap (~5s: the legacy subscribe path under kv.Watch wraps a
+// deadline-less context with the legacy JS context's MaxWait); the DRAIN is
+// what the client never bounds -- a watcher that is established but never
+// delivers parks the drain forever without this timeout. The step context is
+// safe to hand to this Watch because the watcher is scoped to the step (see
+// startStepContext); nats.go unsubscribes the subscription when the context
+// is done, which closes the updates channel -- so a drain cut short that way
+// must be reported as the timeout it is, never mistaken for a completed load.
 func (p *Provider) loadInitialMembers() error {
-	prefix := p.config.KeyPrefix + ".members."
+	bucketName := p.config.memberBucketName(p.clusterName)
+	keys := p.config.KeyPrefix + ".members.>"
 
-	watcher, err := p.memberBucket.Watch(p.ctx, prefix+">", jetstream.IncludeHistory())
+	start := time.Now()
+	ctx, cancel := p.startStepContext()
+	defer cancel()
+
+	watcher, err := p.memberBucket.Watch(ctx, keys, jetstream.IncludeHistory())
 	if err != nil {
-		return fmt.Errorf("natskv: watch initial members: %w", err)
+		return fmt.Errorf("natskv: load initial members: watch keys %q in bucket %q: %w (elapsed %s)",
+			keys, bucketName, err, stepElapsed(start))
 	}
 	defer watcher.Stop()
 
-	for entry := range watcher.Updates() {
-		if entry == nil {
-			// nil signals end of initial values
-			break
-		}
-		if entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge {
-			continue
-		}
-		p.handleMemberPut(entry)
+	drainErr := func(cause error) error {
+		return fmt.Errorf("natskv: load initial members: drain history of keys %q in bucket %q: %w (elapsed %s)",
+			keys, bucketName, cause, stepElapsed(start))
 	}
 
-	return nil
+	for {
+		select {
+		case entry, ok := <-watcher.Updates():
+			if !ok {
+				// The channel closed without the end-of-initial-values
+				// sentinel. When our own step context is done, that close IS
+				// the timeout (or a shutdown) arriving through nats.go's
+				// unsubscribe-on-context-done, and reporting success would
+				// silently truncate the member load. Otherwise the watcher
+				// died server-side; keep the historical nil so startup
+				// proceeds and reconcile self-heals whatever the truncated
+				// drain missed.
+				if ctx.Err() != nil {
+					return drainErr(ctx.Err())
+				}
+				return nil
+			}
+			if entry == nil {
+				// nil signals end of initial values
+				return nil
+			}
+			if entry.Operation() == jetstream.KeyValueDelete || entry.Operation() == jetstream.KeyValuePurge {
+				continue
+			}
+			p.handleMemberPut(entry)
+		case <-ctx.Done():
+			return drainErr(ctx.Err())
+		}
+	}
 }
 
 // handleMemberPut processes a Put event for a member key.
@@ -537,12 +630,19 @@ func (p *Provider) startWatching() {
 						metric.WithAttributes(actor.SystemLabels(p.cluster.ActorSystem)...),
 					)
 				}
+			}
 
-				select {
-				case <-time.After(p.config.RetryInterval):
-				case <-p.ctx.Done():
-					return
-				}
+			// Every respin re-creates the watch consumer, so every respin
+			// waits RetryInterval first -- the clean channel close included
+			// (keepWatching returns nil when the server closes the delivery
+			// subscription without erroring the next Watch), which previously
+			// respun with zero delay: a hot consumer-creation loop against an
+			// unhealthy server. Shutdown is not delayed: Shutdown cancels the
+			// provider context before waiting, so the second arm fires.
+			select {
+			case <-time.After(p.config.RetryInterval):
+			case <-p.ctx.Done():
+				return
 			}
 		}
 	}()
@@ -784,12 +884,14 @@ func (p *Provider) startLeaderWatching() {
 				p.logger().Error("Leader watcher failed, retrying",
 					slog.String("provider", "natskv"),
 					slog.Any("error", err))
+			}
 
-				select {
-				case <-time.After(p.config.RetryInterval):
-				case <-p.ctx.Done():
-					return
-				}
+			// Wait RetryInterval before every respin, the clean channel close
+			// included -- same reasoning as startWatching's loop.
+			select {
+			case <-time.After(p.config.RetryInterval):
+			case <-p.ctx.Done():
+				return
 			}
 		}
 	}()
@@ -918,12 +1020,20 @@ func (p *Provider) refreshLeaderKey() error {
 // attemptLeaderElection tries to become leader using atomic Create.
 // Create returns ErrKeyExists if the leader key already exists, meaning
 // another member holds leadership.
+//
+// The Create is fire-and-forget -- any error means another member holds
+// leadership -- but the call itself runs under the provider-owned step
+// timeout, so a wedged server cannot park StartMember's tail, or a
+// re-election triggered from the leader watcher or refresh loop, forever.
 func (p *Provider) attemptLeaderElection() {
 	key := p.leaderKey()
 	data := []byte(fmt.Sprintf(`{"memberID":"%s","electedAt":"%s"}`,
 		p.self.ID, time.Now().UTC().Format(time.RFC3339)))
 
-	_, err := p.leaderBucket.Create(p.ctx, key, data)
+	ctx, cancel := p.startStepContext()
+	defer cancel()
+
+	_, err := p.leaderBucket.Create(ctx, key, data)
 	if err != nil {
 		// Another member is already leader or NATS error
 		return
